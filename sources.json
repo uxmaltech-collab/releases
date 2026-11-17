@@ -1,0 +1,13 @@
+{
+  "schema": "uxmaltech-collab.release-sources/v1",
+  "sot": "uxmaltech-collab/ai-templates-resources",
+  "repositories": [
+    "uxmaltech-collab/agents-personas",
+    "uxmaltech-collab/agents-sre",
+    "uxmaltech-collab/canon-mcp-sre",
+    "uxmaltech-collab/github-runners-host-sre",
+    "uxmaltech-collab/harness-agent-host-menu-sre",
+    "uxmaltech-collab/operator-bus-sre",
+    "uxmaltech-collab/person-sessions-sre"
+  ]
+}
