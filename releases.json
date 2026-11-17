@@ -1,6 +1,6 @@
 {
  "schema": "uxmaltech-collab.releases/v1",
- "generated_at": "2026-11-17T00:29:59Z",
+ "generated_at": "2026-11-17T02:42:55Z",
  "components": {
   "containers/agent-base": {
    "repository": "uxmaltech-collab/ai-templates-resources",
@@ -431,8 +431,14 @@
   "repo-structure/collab-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "1.80.0",
+   "latest": "1.81.0",
    "releases": [
+    {
+     "version": "1.81.0",
+     "date": "2026-11-16",
+     "commit": "4faff0bd65a7e03fc13ed381341fb37f3ed63aa3",
+     "changelog": "**Artifact repository contract.** Class-pinned `schema/artifact-repository-v1.schema.json` (`artifact-repository-v1`) for the canon's `governance/artifact-repositories.yaml`: the organization's artifact repositories, the default one, `ephemeral_retention_days` (fewer than 30 warns and 30 applies) and per repository its driver, flavor, bucket, endpoint, public base URL, private prefix, signed-link ceiling and credential binding reference, never a value (owner decisions D3 and D7, 2026-11-16; rule in `skills/artifact-publication`). Schema set 1.14."
+    },
     {
      "version": "1.80.0",
      "date": "2026-11-16",
@@ -1164,8 +1170,14 @@
   "repo-structure/infra-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "1.133.0",
+   "latest": "1.134.0",
    "releases": [
+    {
+     "version": "1.134.0",
+     "date": "2026-11-16",
+     "commit": "c7c06192fd97be8a2358b1c9469cb91b9cf42706",
+     "changelog": "**Publication rules leave the class.** `skills/host/_contracts/asset-publication.md` keeps only how this class implements the route and the credential (route declaration, typed registrar, session and container delivery); its private prefix, 24-hour links, retention and store probes move to the new `skills/artifact-publication` skill (`references/store.md`), which it now names as the rule. The descriptor carries the new text. The embedded `human-artifact-authoring` copy keeps its 0.6.0 hold."
+    },
     {
      "version": "1.133.0",
      "date": "2026-11-16",
@@ -2251,8 +2263,14 @@
   "repo-structure/product-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "1.62.0",
+   "latest": "1.63.0",
    "releases": [
+    {
+     "version": "1.63.0",
+     "date": "2026-11-16",
+     "commit": "fe9faf9bbdce425f05ecc30467e29ae5cc8f6bcb",
+     "changelog": "Embeds `human-artifact-authoring` 0.20.0: publication moves to the `artifact-publication` skill (`SKILL.md`, `references/evidence-files.md` and `references/visual-clarity.md` point there). The pack adopts `skills/artifact-publication` 0.1.0 as its own component."
+    },
     {
      "version": "1.62.0",
      "date": "2026-11-16",
@@ -2744,8 +2762,14 @@
   "repo-structure/repo-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "2.32.0",
+   "latest": "2.33.0",
    "releases": [
+    {
+     "version": "2.33.0",
+     "date": "2026-11-16",
+     "commit": "fe9faf9bbdce425f05ecc30467e29ae5cc8f6bcb",
+     "changelog": "Embeds `human-artifact-authoring` 0.20.0: publication moves to the `artifact-publication` skill (`SKILL.md`, `references/evidence-files.md` and `references/visual-clarity.md` point there). The pack adopts `skills/artifact-publication` 0.1.0 as its own component."
+    },
     {
      "version": "2.32.0",
      "date": "2026-11-16",
@@ -3484,8 +3508,20 @@
   "runners/journey-flows-mcp": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "0.4.0",
+   "latest": "0.6.0",
    "releases": [
+    {
+     "version": "0.6.0",
+     "date": "2026-11-16",
+     "commit": "be6f4ae91e0755f972ebd3454d848fe54fffdaa4",
+     "changelog": "**Only evidence files become durables, after the secret filter; retention never removes them.** Public is limited to durable candidates: `captures/*.png`, `hierarchy/*.json` and `journey/*.json` whose `schema` is `journey-captures-v1` or `journey-hierarchy-v1`; reports, arbitrary HTML, traces, videos and logs stay private. Each candidate is searched, before upload, for the run's secret values held in memory (any length, raw or JSON-escaped, and in the decoded JSON strings) and for credential shapes; one that holds either is published private, named under `withheld` in the manifest and the receipt and warned in the job log, as are the non-durable objects a public request leaves private. A text object that names a forbidden host keeps its visibility and is warned in the job log instead of failing the publication (a hostname is not a secret). On `/mobile` the vault detection follows `runFlow` and `runScript` includes, an unreadable include counts as a read, and from the first such flow every capture and hierarchy of the job stays private. `secrets[]` follows the common contract `{name, kind, source}` (`kind` `hydration-token` or `vault`, `source` `vault:<surface>/<repository>/<entry>`), never a value; a declared secret with no usable value in memory (empty, partial, or after a restart) and a `/mobile` replay that did not finish (cancelled, timed out, failed) make the publication private with a warning. Retention removes only private objects: the durables and their manifest (`evidence.durable_keys`) never expire. HTML, JS, CSS, CSV and SVG objects are redacted too. [`references/evidence.md`](references/evidence.md) keeps only the service configuration and links the [artifact publication](../../skills/artifact-publication/SKILL.md) rule."
+    },
+    {
+     "version": "0.5.0",
+     "date": "2026-11-16",
+     "commit": "bcec11b5c00f4ce1117f1e363ea87df6906d17c7",
+     "changelog": "**A hydrated run may publish public durables** (owner decision D8 of the single artifact-publication plan, 2026-11-16). The rule that forced `private` on every run with hydrated variables is retired: on `/web`, `captures/`, `hierarchy/` and `journey/` follow `evidence.visibility`; logs, results and traces stay private. On `/mobile` only a flow that reads a vault entry keeps its capture and hierarchy private. Hydrated values are not secrets and are no longer redacted; the hydration token and the vault entries are, and the receipt's new `secrets[]` names them (`hydration-token`, `vault-entry`), never their values ([evidence](references/evidence.md#visibility), [hydration](references/hydration.md#receipt))."
+    },
     {
      "version": "0.4.0",
      "date": "2026-11-15",
@@ -3752,6 +3788,19 @@
      "date": "2026-09-16",
      "commit": "5be2229ea68b5b997ef5e37fda906a50c687bec3",
      "changelog": "Initial pinned five-family diagram module and verified S3 asset delivery."
+    }
+   ]
+  },
+  "skills/artifact-publication": {
+   "repository": "uxmaltech-collab/ai-templates-resources",
+   "kind": "sot",
+   "latest": "0.1.0",
+   "releases": [
+    {
+     "version": "0.1.0",
+     "date": "2026-11-16",
+     "commit": "b39b66406fbf83cf355b2bc031c92309a8276dfc",
+     "changelog": "**One rule for publishing artifacts** (owner decisions 2026-11-16, D5 to D8). Moves here, as the only normative copy: the review-publication rules of `human-artifact-authoring` (`references/evidence-files.md`), its delivery rule and diagram delivery (`references/visual-clarity.md`), and the private prefix, store guarantees and rebuild probes of the infrastructure class's asset-publication contract. Adds: durable and ephemeral classes for every agent including UX/UI; an ephemeral object kept at least the organization's `ephemeral_retention_days` (never fewer than 30) by a store lifecycle rule; hydrated runs may produce durables, a declared secret or credential pattern is the only refusal; the destination comes from the organization's `artifact-repository-v1` declaration in its canon, never from prose; personal data, authority and recovery rules (trusted code only, generation is not authorization, recovery before cleanup, uncertain uploads reconciled without overwrite) move here from the canon's journey-evidence."
     }
    ]
   },
@@ -4212,8 +4261,14 @@
   "skills/epic-rules": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "0.1.0",
+   "latest": "0.2.0",
    "releases": [
+    {
+     "version": "0.2.0",
+     "date": "2026-11-16",
+     "commit": "8bc290b0c4e124234b491cf75e6df67adb4aa81f",
+     "changelog": "Universal rule U-DELIVERY-FINDING-RETURNS-TO-STORY (owner decision 2026-11-17): a staging or acceptance finding where delivered code does not do what a story asked is that story's unfinished work, commented on it and sent to fix now, closed when the same journey step passes; only a finding no story had in scope becomes a new story; never a follow-up defect story or a separate work order."
+    },
     {
      "version": "0.1.0",
      "date": "2026-11-16",
@@ -4262,8 +4317,14 @@
   "skills/human-artifact-authoring": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "0.19.0",
+   "latest": "0.20.0",
    "releases": [
+    {
+     "version": "0.20.0",
+     "date": "2026-11-16",
+     "commit": "4cc0ddc3f7f58d0c96e8caebdd68f1db75aaff96",
+     "changelog": "**How an artifact is written, only.** Publication moves to the new `artifact-publication` skill (owner decision D5, 2026-11-16): the review-publication section of `references/evidence-files.md` and the diagram and requested-artifact delivery of `references/visual-clarity.md` become one line each pointing there; `SKILL.md` says publication follows that skill. The evidence check, its body audits and the evidence schemas stay here unchanged: the schemas are byte copies of the contracts that own them (`contracts/deterministic-evidence/`, `contracts/journey-captures/`), so moving the copies would not make a single source."
+    },
     {
      "version": "0.19.0",
      "date": "2026-11-16",
