@@ -1,6 +1,6 @@
 {
  "schema": "uxmaltech-collab.releases/v1",
- "generated_at": "2026-11-17T00:20:23Z",
+ "generated_at": "2026-11-17T00:29:59Z",
  "components": {
   "containers/agent-base": {
    "repository": "uxmaltech-collab/ai-templates-resources",
@@ -5959,8 +5959,14 @@
   "sre/collab-developer": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "0.73.0",
+   "latest": "0.74.0",
    "releases": [
+    {
+     "version": "0.74.0",
+     "date": "2026-11-16",
+     "commit": "1542efb48fbb40e18e29c935798917097369c1ad",
+     "changelog": "**Public release index.** `references/release.md` gains step 6: after a release of the source of truth merges, or a `vX.Y.Z` tag of a repository listed in `sources.json` of `uxmaltech-collab/releases` is pushed, the developer regenerates `releases.json` there with `scripts/build_index.py` from the fetched clones and commits it to `main` (version, date and changelog of each release, and a SoT row's commit). The Collab console reads that public index with no credential for its «Desfase» page (owner decision, 2026-11-16: uxmaltech-collab has a public release process the console reads). `AGENTS.md` points to the step. A stale index blocks nothing. Floors unchanged."
+    },
     {
      "version": "0.73.0",
      "date": "2026-11-16",
