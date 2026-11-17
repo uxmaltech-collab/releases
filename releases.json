@@ -1,6 +1,6 @@
 {
  "schema": "uxmaltech-collab.releases/v1",
- "generated_at": "2026-11-17T02:42:55Z",
+ "generated_at": "2026-11-17T03:56:28Z",
  "components": {
   "containers/agent-base": {
    "repository": "uxmaltech-collab/ai-templates-resources",
@@ -1170,8 +1170,14 @@
   "repo-structure/infra-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "1.134.0",
+   "latest": "1.135.0",
    "releases": [
+    {
+     "version": "1.135.0",
+     "date": "2026-11-16",
+     "commit": "6f81392bea1e9bedfce740a097feea641b37459f",
+     "changelog": "**The confirm-gate pin follows 2.17.1 and its descriptor digest only warns.** `manifest.yaml` pins the four `gates/confirm-gate` assets at 2.17.1 (`9ba495a7`); the 2.17.1 release had moved the renderer constant and the embedded descriptor but left the manifest at 2.16.0, so the instantiated class carried the 2.16.0 text and the renderer refused. `sidecars/operator/render-operator-instructions` now warns on a descriptor digest difference and still verifies the four asset bytes before rendering. `declarative-v1.json` re-embeds `skills/host/identity-format.json` with the `agent-bgs` rows."
+    },
     {
      "version": "1.134.0",
      "date": "2026-11-16",
@@ -2263,8 +2269,14 @@
   "repo-structure/product-resources": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "1.63.0",
+   "latest": "1.64.0",
    "releases": [
+    {
+     "version": "1.64.0",
+     "date": "2026-11-16",
+     "commit": "29011112fd014a925e0320b942a6a72200b28f1d",
+     "changelog": "The loaded ux-ui persona (0.1.3), its README and changelog follow `ux-ui-base` 0.25.0: the hydration scenarios a journey needs are the persona's own work, opened and resolved in the organization's hydration package under its rules; it is a unit of its own (scenario issue, pull request, merge under the package's rules and verified authority); the no-implementation rule keeps holding for delivery repositories."
+    },
     {
      "version": "1.63.0",
      "date": "2026-11-16",
@@ -5375,8 +5387,14 @@
   "skills/ux-ui-base": {
    "repository": "uxmaltech-collab/ai-templates-resources",
    "kind": "sot",
-   "latest": "0.24.0",
+   "latest": "0.25.0",
    "releases": [
+    {
+     "version": "0.25.0",
+     "date": "2026-11-16",
+     "commit": "29011112fd014a925e0320b942a6a72200b28f1d",
+     "changelog": "**The UX/UI figure resolves the hydration scenarios its journeys need** (owner order, 2026-11-17). CON-01 adds \"Hydration scenarios\" to what the figure owns: when no scenario serves a staging-dependent value, it opens the scenario issue in the organization's hydration package and resolves it there (implementation under the package's own instructions, pull request, the package's review and merge rules) until the scenario serves the value; any open scenario issue of the package is its to take when asked; one that needs another team's or an outside provider's data stays open with its owner named. The no-implementation boundary keeps holding for delivery repositories, with this one exception (CONSTITUTION item 3, CON-01 table and Boundaries). `journey:create:maestro` and `journey:create:playwright` say \"resolve it\" instead of \"continue\". New unit `resolve-hydration-scenario` (CON-02) on both `journey:create` modules, whose \"never merge\" now names journey pull requests. UX-07 records the exception. No gate or slot changes."
+    },
     {
      "version": "0.24.0",
      "date": "2026-11-14",
