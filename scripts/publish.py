@@ -16,11 +16,22 @@ What it builds, by class (`--class` overrides the declared one):
 
 - php-package: a stored zip of `git archive` of the tag `vX.Y.Z`, which must hold `composer.json`.
 - runtime, layer: the released files of the version, copied from the directory given with `--files` (wheels,
-  `*.component.json`, `*SHA256SUMS`, `install.py`, lock, manifest, notes). The sums files are checked.
+  `*.component.json`, `*SHA256SUMS`, `install.py`, lock, manifest, notes). The sums files are checked, and the
+  files are bound to the release by its own asset list (a `collab.component-release/v1` `*.component.json` or a
+  `collab.release/v*` `release-manifest.json` that names this repository and the tag's commit): only the files it
+  lists, with the sha256 it records, are published. Without such a list nothing from `--files` is published under
+  the version (it warns; the index is still updated). A directory whose every asset list names another release
+  is refused.
 - sot-component, image-recipe: the tree tar of the component's directory at the commit of its row in the
   README release table (`--commit` overrides), with its `tree_digest` (from the installed cli).
 - service, and an image-recipe of a repository other than the SoT: the tree tar of `--path` (default: the whole
   tree) at the tag's commit or `--commit`.
+- a sub-component `<owner>/<name>/<path>` of a declared repository (declared in `publication.classes`, or
+  published with `--class` other than the repository's and `--path`): the tree tar of `<path>`, under its own
+  index key, so it and its repository's own releases are both found.
+
+A checkout is `<root>/<owner>/<name>` or `<root>/<name>`, and only one whose `origin` remote names that
+repository is read.
 
 The authority of a release is its upstream reference, `repository` + `tag_commit` (or the row's `commit`),
 recorded in the manifest and in the index; the bytes stored here are a verified cache of it. Archives never carry
@@ -29,13 +40,16 @@ the paths the declaration lists in `publication.archive_exclude` (the organizati
 Only what is published is read: tags, `origin/HEAD` and the objects of a checkout, never a working tree. What
 cannot be read (an undeclared component, no checkout, no tag, no `composer.json`, no `--files`, an unreadable
 file, a malformed sums line, a commit that is not on the default branch) warns on stderr and is skipped; the
-index is rewritten anyway, keeping every version it had. Every byte is staged and verified before any live file
-is replaced. The only refusal is an actual byte mismatch: a well-formed sum that is not the file's, a version
-already published with other bytes, a copy or a tar that does not read back as built. Then no live file changes
-and the exit status is 3. Everything else exits 0.
+index is rewritten anyway, keeping every version it had. Every byte is staged and verified, and every destination
+checked, before any live file is replaced; a failure while replacing puts the replaced files back. The only
+refusal is the wrong artifact: a well-formed sum that is not the file's, `--files` of another release, a version
+whose stored bytes differ from the rebuilt ones, a copy or a tar that does not read back as built. Then no live file
+changes and the exit status is 3. A stale sha256 in a manifest whose stored bytes are these is repaired with a
+warning. Everything else exits 0.
 
-It ends with `git add` and one commit of `releases.json` and the release folder, unless `--no-commit` (or when
-the files that must go through Git LFS cannot: no `git lfs`, or `.gitattributes` does not cover them).
+It ends with `git add` and one commit of `releases.json`, the release's MANIFEST.json and the artifacts it lists
+(nothing else in the folder), unless `--no-commit`, or when an artifact that must go through Git LFS would not be
+stored as the LFS pointer of its declared bytes (no `git lfs`, `.gitattributes` does not cover it, another filter).
 """
 from __future__ import annotations
 
@@ -101,32 +115,147 @@ def component_requires(path: Path, commit: str, component: str) -> list[dict]:
             if isinstance(v, dict) and isinstance(v.get("component"), str) and isinstance(v.get("version"), str)]
 
 
+def is_sums(name: str) -> bool:
+    return name == "SHA256SUMS" or name.endswith(".SHA256SUMS")
+
+
+def sums_entries(text: str, name: str, quiet: bool = False) -> list[tuple[str, str]]:
+    """The well-formed `(sha256, file name)` lines of a sums file; a malformed line warns (unless `quiet`)."""
+    rows = []
+    for number, line in enumerate(text.splitlines(), 1):
+        parts = line.strip().split(None, 1)
+        if not parts or parts[0].startswith("#"):
+            continue
+        if len(parts) != 2:
+            if not quiet:
+                warn(f"{name}:{number}: not `<sha256>  <name>`; not checked")
+            continue
+        listed, target = parts[0].lower(), parts[1].lstrip("*").strip()
+        if not HEX64.match(listed):
+            if not quiet:
+                warn(f"{name}:{number}: the sum for {target} is not a SHA-256; not checked")
+            continue
+        rows.append((listed, target))
+    return rows
+
+
 def sums_check(directory: Path, digests: dict[str, str]) -> None:
     """A `SHA256SUMS` file lists `<sha256>  <name>`. A well-formed sum that is not the listed file's is a Refusal
     (the bytes are not the released ones); a malformed line, an unreadable sums file or a file that is not in the
     directory warns and is not checked."""
     for name in sorted(digests):
-        if not (name == "SHA256SUMS" or name.endswith(".SHA256SUMS")):
+        if not is_sums(name):
             continue
         try:
             text = (directory / name).read_text(encoding="utf-8", errors="replace")
         except OSError as error:
             warn(f"{name}: cannot be read ({type(error).__name__}); its sums are not checked")
             continue
-        for number, line in enumerate(text.splitlines(), 1):
-            parts = line.strip().split(None, 1)
-            if not parts or parts[0].startswith("#"):
-                continue
-            if len(parts) != 2:
-                warn(f"{name}:{number}: not `<sha256>  <name>`; not checked")
-                continue
-            listed, target = parts[0].lower(), parts[1].lstrip("*").strip()
-            if not HEX64.match(listed):
-                warn(f"{name}:{number}: the sum for {target} is not a SHA-256; not checked")
-            elif target not in digests:
+        for listed, target in sums_entries(text, name):
+            if target not in digests:
                 warn(f"{name} lists {target}, which is not in the directory")
             elif digests[target] != listed:
                 raise art.Refusal(f"{name} lists another sha256 for {target} than the file has")
+
+
+ASSET_LIST_SCHEMA = re.compile(r"(?:^|\.)(?:component-release|release)/v\d+$")
+
+
+def asset_list(entry: dict) -> dict | None:
+    """The release asset list a `--files` entry is, or None: a JSON file of the runtime's release contracts
+    (`collab.component-release/v1` `*.component.json`, `collab.release/v*` `release-manifest.json`) whose record
+    (`component` or `runtime`) names the repository, version and commit it was built from, and whose `files`
+    list the name and sha256 of each released file."""
+    if not entry["name"].endswith(".json"):
+        return None
+    try:
+        raw = entry["src"].read_bytes() if isinstance(entry["src"], Path) else entry["src"]
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("schema"), str) or not ASSET_LIST_SCHEMA.search(data["schema"]):
+        return None
+    record = next((data[k] for k in ("component", "runtime") if isinstance(data.get(k), dict)), None)
+    if record is None or not isinstance(data.get("files"), list):
+        return None
+    files = {}
+    for row in data["files"]:
+        if isinstance(row, dict) and isinstance(row.get("name"), str) and isinstance(row.get("sha256"), str):
+            files[row["name"]] = row["sha256"].lower()
+    versions = {str(v).removeprefix("v") for v in (data.get("version"), record.get("version")) if isinstance(v, str)}
+    return {"repository": record.get("repository") if isinstance(record.get("repository"), str) else None,
+            "commit": record.get("commit") if isinstance(record.get("commit"), str) else None,
+            "versions": versions, "files": files}
+
+
+def bind_release_files(component: str, version: str, tag_commit: str | None, listing: list[dict]) -> list[dict]:
+    """The `--files` entries that belong to `component` `version`, by the release's own asset list.
+
+    An asset list binds when it names this repository and the commit of the tag (or, with no tag to compare, this
+    version). Every file it lists must have the sha256 it records; a sums file binds when every file it lists is
+    bound. When every asset list in the directory names another release (another repository, commit or version),
+    the directory is another release's: a Refusal. With no asset list that can bind, nothing is published under the
+    version (it warns: the index is still updated and keeps what it had)."""
+    agreeing, other = [], []
+    for entry in listing:
+        found = asset_list(entry)
+        if found is None:
+            continue
+        if found["repository"] and found["repository"].lower() != component.lower():
+            other.append(f"{entry['name']} is the asset list of {found['repository']}")
+        elif tag_commit and found["commit"]:
+            if idx.same_commit(found["commit"], tag_commit):
+                agreeing.append((entry, found))
+            else:
+                other.append(f"{entry['name']} lists the files of commit {found['commit'][:12]}, not of the tag "
+                             f"v{version} ({tag_commit[:12]})")
+        elif found["versions"]:
+            if version in found["versions"]:
+                if not tag_commit:
+                    warn(f"{entry['name']}: bound to {component} {version} by its version only (there is no tag "
+                         "commit to compare with)")
+                agreeing.append((entry, found))
+            else:
+                other.append(f"{entry['name']} lists the files of version {', '.join(sorted(found['versions']))}")
+        else:
+            warn(f"{entry['name']}: an asset list that names neither a commit nor a version; it binds nothing")
+    if not agreeing:
+        if other:
+            raise art.Refusal(f"the --files of {component} {version} are another release's ({'; '.join(other)})")
+        warn(f"{component} {version}: --files holds no asset list of this release (a *.component.json or a "
+             "release-manifest.json naming its repository and commit); nothing from it is published under this "
+             "version, and the index keeps what it had")
+        return []
+    for problem in other:
+        warn(f"{problem}; published only if this release's asset list names it")
+    by_name = {e["name"]: e for e in listing}
+    declared: dict[str, str] = {}
+    for entry, found in agreeing:
+        for name, digest in found["files"].items():
+            if declared.get(name, digest) != digest:
+                raise art.Refusal(f"two asset lists of {component} {version} record other sha256 for {name}")
+            declared[name] = digest
+    bound = {entry["name"] for entry, _ in agreeing}
+    for name, digest in sorted(declared.items()):
+        if name not in by_name:
+            warn(f"{name}: listed by the asset list of {component} {version}, not readable in --files; not published")
+        elif by_name[name]["sha256"] != digest:
+            raise art.Refusal(f"{name} has another sha256 than the asset list of {component} {version} records")
+        else:
+            bound.add(name)
+    for entry in listing:
+        if is_sums(entry["name"]) and entry["name"] not in bound:
+            try:
+                text = entry["src"].read_text(encoding="utf-8", errors="replace") if isinstance(entry["src"], Path) else entry["src"].decode("utf-8", "replace")
+            except OSError:
+                continue
+            targets = {target for _, target in sums_entries(text, entry["name"], quiet=True)}
+            if targets and targets <= bound:
+                bound.add(entry["name"])
+    for entry in listing:
+        if entry["name"] not in bound:
+            warn(f"{entry['name']}: not in the asset list of {component} {version}; not published")
+    return [e for e in listing if e["name"] in bound]
 
 
 def gather(registry_sources: dict, root: Path, component: str, version: str, cls: str | None, files_dir: Path | None,
@@ -140,6 +269,26 @@ def gather(registry_sources: dict, root: Path, component: str, version: str, cls
     if component in registry_sources["invalid"]:
         warn(f"{component}: its declaration is not usable (warned above); nothing published")
         return None
+    parent = idx.parent_repository(registry_sources, component)
+    if parent is not None:
+        info["repository"] = parent
+        info["class"] = cls or registry_sources["classes"].get(component)
+        if info["class"] not in idx.TREE_CLASSES:
+            warn(f"{component}: a sub-component of {parent} is a tree ({', '.join(idx.TREE_CLASSES)}); its class "
+                 f"is {info['class'] or 'not declared'} (declare it in publication.classes, or give --class); "
+                 "nothing published")
+            return None
+        path = idx.checkout(root, parent)
+        tag = f"v{version}"
+        commit = idx.tag_commit(path, tag) if path is not None else None
+        info.update(tag=tag if commit else None, tag_commit=commit, commit=commit)
+        if commit:
+            info["date"] = (idx.git(path, "for-each-ref", "--format=%(creatordate:short)", f"refs/tags/{tag}") or "").strip() or None
+        subtree = component[len(parent) + 1:]
+        if tree_path and tree_path.strip("/") != subtree:
+            warn(f"--path {tree_path!r}: {component} is the tree at {subtree}; --path is ignored")
+        tree_at(info, path, commit_override or commit, subtree, bool(commit_override), component)
+        return info
     if component in registry_sources["repositories"]:
         info["repository"] = component
         info["class"] = cls or idx.repository_class(registry_sources, component)
@@ -153,7 +302,9 @@ def gather(registry_sources: dict, root: Path, component: str, version: str, cls
             info["date"] = (idx.git(path, "for-each-ref", "--format=%(creatordate:short)", f"refs/tags/{tag}") or "").strip() or None
         kind = info["class"]
         if kind == "php-package":
-            if commit:
+            if commit and not registry_sources.get("exclude_known", True):
+                warn(f"{component}: the paths the declaration excludes from archives are not known; no zip built")
+            elif commit:
                 package, requires = composer_info(path, tag, registry_sources.get("vendors"))
                 payload = art.php_zip(path, tag, exclude)
                 if payload is None:
@@ -171,15 +322,7 @@ def gather(registry_sources: dict, root: Path, component: str, version: str, cls
                     else:
                         warn(f"{entry}: not a regular file; skipped")
         else:  # service, image-recipe of another repository, anything that is a tree
-            info["path"] = tree_path or ""
-            at = commit_override or commit
-            if path is None or not at:
-                warn(f"{component}: no commit to read the tree at (no tag, no --commit); nothing built")
-            elif commit_override and not is_ancestor(path, at):
-                warn(f"{component}: {at} is not on the default branch; nothing built")
-            else:
-                info["commit"] = at
-                info["tree_at"] = (path, at, info["path"])
+            tree_at(info, path, commit_override or commit, tree_path or "", bool(commit_override), component)
         return info
     sot = registry_sources["sot"]
     if not sot:
@@ -211,6 +354,18 @@ def gather(registry_sources: dict, root: Path, component: str, version: str, cls
     return info
 
 
+def tree_at(info: dict, path: Path | None, at: str | None, subtree: str, override: bool, component: str) -> None:
+    """Record where the tree tar of a repository (or of one of its sub-components) is read: `at` of `path`."""
+    info["path"] = subtree
+    if path is None or not at:
+        warn(f"{component}: no commit to read the tree at (no tag, no --commit); nothing built")
+    elif override and not is_ancestor(path, at):
+        warn(f"{component}: {at} is not on the default branch; nothing built")
+    else:
+        info["commit"] = at
+        info["tree_at"] = (path, at, subtree)
+
+
 def lfs_ready(registry: Path, names: list[str]) -> str | None:
     """Why the files that must go through Git LFS cannot be committed from here, or None when they can."""
     needing = [n for n in names if art.is_lfs(Path(n).name)]
@@ -225,15 +380,60 @@ def lfs_ready(registry: Path, names: list[str]) -> str | None:
     return None
 
 
-def commit_release(registry: Path, paths: list[Path], lfs_names: list[str], message: str) -> bool:
+LFS_POINTER = re.compile(r"^version https://git-lfs\.github\.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize (\d+)\n$")
+
+
+def release_paths(destination: Path) -> tuple[list[Path], dict[str, dict]]:
+    """The files of a release folder that belong to the release: its MANIFEST.json and every artifact it lists that
+    is on disk, with each artifact's declared `{sha256, bytes}`. Anything else in the folder (a file a failed run
+    left, a stray file) is not part of it and is never staged."""
+    manifest_file = destination / "MANIFEST.json"
+    manifest = idx.read_manifest(manifest_file) if manifest_file.is_file() else None
+    if not manifest:
+        return [], {}
+    paths, declared = [manifest_file], {}
+    for row in idx.manifest_artifacts(manifest, str(manifest_file)) or []:
+        target = destination / row["name"]
+        if target.is_file() and not target.is_symlink():
+            paths.append(target)
+            declared[row["name"]] = row
+    return paths, declared
+
+
+def lfs_pointer_problem(registry: Path, relative: str, row: dict) -> str | None:
+    """Why the blob git would store for an LFS artifact is not the LFS pointer of its declared bytes, or None. The
+    clean filter is run through `git hash-object --path` (as `git add` would), so nothing is staged to find out."""
+    blob = idx.git(registry, "hash-object", "-w", f"--path={relative}", "--", relative)
+    stored = idx.git(registry, "cat-file", "blob", blob.strip()) if blob else None
+    if stored is None:
+        return f"what git would store for {relative} cannot be read"
+    match = LFS_POINTER.match(stored)
+    if not match:
+        return f"git would store {relative} as an ordinary blob, not as a Git LFS pointer"
+    if match.group(1) != row.get("sha256") or (isinstance(row.get("bytes"), int) and int(match.group(2)) != row["bytes"]):
+        return f"the Git LFS pointer of {relative} is not the one of the bytes its manifest declares"
+    return None
+
+
+def commit_release(registry: Path, index_path: Path | None, destination: Path, message: str) -> bool:
+    """Stage and commit the index and the release (its manifest and the artifacts it lists), and nothing else.
+    Every artifact that goes through Git LFS must become the LFS pointer of its declared bytes; otherwise nothing is
+    staged or committed (it warns: the files stay written)."""
     if idx.git(registry, "rev-parse", "--show-toplevel") is None:
         warn(f"{registry} is not a git checkout; nothing staged or committed")
         return False
-    reason = lfs_ready(registry, lfs_names)
+    files, declared = release_paths(destination)
+    paths = ([index_path] if index_path is not None else []) + files
+    if not paths:
+        return False
+    rel = [str(p.relative_to(registry)) for p in paths]
+    lfs = {str((destination / n).relative_to(registry)): row for n, row in declared.items() if art.is_lfs(n)}
+    reason = lfs_ready(registry, sorted(lfs))
+    for relative, row in sorted(lfs.items()):
+        reason = reason or lfs_pointer_problem(registry, relative, row)
     if reason:
         warn(f"not committed ({reason}); the files are written and not staged")
         return False
-    rel = [str(p.relative_to(registry)) for p in paths]
     if idx.git(registry, "add", "--", *rel) is None:
         warn("git add failed; nothing committed")
         return False
@@ -283,45 +483,86 @@ def tree_row(component: str, version: str, info: dict, exclude: list[str]) -> di
     return row
 
 
-def bind_to_previous(component: str, version: str, destination: Path, listing: list[dict], old: dict) -> None:
-    """A published version takes no other bytes. A prior row with a well-formed sha256 that differs, or (with no
-    usable prior sha256) a stored file whose bytes differ, is a Refusal. Missing evidence warns. A row with the same
-    bytes keeps what the prior row recorded (a tree_digest the cli is not here to compute again)."""
+def bind_to_previous(component: str, version: str, destination: Path, listing: list[dict], old: dict) -> list[dict]:
+    """A published version takes no other bytes; the stored bytes decide. The entries that may be (re)written:
+
+    - a stored file with the same bytes: kept (when the manifest records another sha256 for it, that record is
+      stale: it warns and the record is repaired);
+    - a stored file with other bytes: a Refusal;
+    - no stored file (or one that cannot be read) while the manifest records another well-formed sha256: the
+      recorded binding is kept and this file is not written (it warns: nothing proves which bytes are right);
+    - otherwise (a new file, or the recorded sha256 is this one): written.
+
+    A row with the bytes its manifest records keeps what that row recorded (a tree_digest the cli is not here to
+    compute again)."""
+    keep = []
     for entry in listing:
         before = old.get(entry["name"])
         prior_sha = before.get("sha256") if before else None
-        if isinstance(prior_sha, str) and HEX64.match(prior_sha):
-            if prior_sha != entry["sha256"]:
-                raise art.Refusal(f"{component} {version}: {entry['name']} is already published with another sha256; "
-                                  "a published version takes no other bytes (cut a new version)")
-            for field in ("tree_digest", "files"):
-                if field not in entry and field in before:
-                    entry[field] = before[field]
-            continue
-        if before is not None:
+        recorded = isinstance(prior_sha, str) and HEX64.match(prior_sha) is not None
+        if before is not None and not recorded:
             warn(f"{component} {version}: the manifest records no usable sha256 for {entry['name']}; checking the stored file")
-        stored = destination / entry["name"]
-        if stored.is_file():
+        stored, stored_sha = destination / entry["name"], None
+        if stored.is_file() and not stored.is_symlink():
             try:
                 stored_sha = art.sha256_file(stored)
             except OSError as error:
                 warn(f"{stored}: cannot be read ({type(error).__name__}); its bytes are not compared")
+        if stored_sha is not None and stored_sha != entry["sha256"]:
+            raise art.Refusal(f"{component} {version}: the stored {entry['name']} has other bytes; "
+                              "a published version takes no other bytes (cut a new version)")
+        if recorded and prior_sha != entry["sha256"]:
+            if stored_sha is None:
+                warn(f"{component} {version}: the manifest records another sha256 for {entry['name']} and the stored "
+                     "file cannot be compared; the recorded binding is kept and this file is not written")
                 continue
-            if stored_sha != entry["sha256"]:
-                raise art.Refusal(f"{component} {version}: the stored {entry['name']} has other bytes; "
-                                  "a published version takes no other bytes (cut a new version)")
+            warn(f"{component} {version}: the manifest records a stale sha256 for {entry['name']}; the stored bytes "
+                 "are these, so the record is repaired")
+        elif recorded:
+            for field in ("tree_digest", "files"):
+                if field not in entry and field in before:
+                    entry[field] = before[field]
+        keep.append(entry)
+    return keep
+
+
+def reference_disagrees(previous: dict, info: dict) -> str | None:
+    """The commit a published version's manifest is bound to, when this publication reads another one for it."""
+    field = "tag_commit" if isinstance(previous.get("tag_commit"), str) and isinstance(info.get("tag_commit"), str) else "commit"
+    bound, now = previous.get(field), info.get(field)
+    if isinstance(bound, str) and isinstance(now, str) and not idx.same_commit(bound, now):
+        return bound
+    return None
 
 
 def stage_and_replace(destination: Path, listing: list[dict], manifest_text: str) -> list[Path]:
-    """Write every file as `.<name>.part`, verify each staged file's sha256, and only then replace the live files
-    (the manifest last). Any failure removes what was staged and leaves every live file as it was."""
+    """Write every file as `.<name>.part`, verify each staged file's sha256, check every destination can take a
+    file, and only then replace the live files (the manifest last), keeping each replaced live file aside until all
+    are in place. Any failure removes what was staged, puts every replaced live file back and leaves the release as
+    it was (Unverified for a failure to write, Refusal for staged bytes that are not the source's)."""
     missing, d = [], destination
     while not d.exists():
         missing.append(d)
         d = d.parent
-    destination.mkdir(parents=True, exist_ok=True)
     staged: list[tuple[Path, Path]] = []
+    replaced: list[tuple[Path, Path | None]] = []
+
+    def clean_up():
+        for target, backup in reversed(replaced):  # put the live release back as it was
+            if backup is not None:
+                os.replace(backup, target)
+            else:
+                target.unlink(missing_ok=True)
+        for part, _ in staged:
+            part.unlink(missing_ok=True)
+        for folder in missing:  # deepest first: only the folders this run made, and only when empty
+            try:
+                folder.rmdir()
+            except OSError:
+                break
+
     try:
+        destination.mkdir(parents=True, exist_ok=True)
         for entry in listing:
             part, target = destination / f".{entry['name']}.part", destination / entry["name"]
             staged.append((part, target))
@@ -340,17 +581,28 @@ def stage_and_replace(destination: Path, listing: list[dict], manifest_text: str
         part.write_text(manifest_text, encoding="utf-8")
         if part.read_text(encoding="utf-8") != manifest_text:
             raise Unverified(f"{part} does not read back as written")
-    except BaseException:
-        for part, _ in staged:
-            part.unlink(missing_ok=True)
-        for folder in missing:  # deepest first: only the folders this run made, and only when empty
-            try:
-                folder.rmdir()
-            except OSError:
-                break
+        for _, target in staged:  # preflight: every destination is absent or a regular file
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise Unverified(f"{target} is not a regular file; it cannot be replaced")
+        for part, target in staged:
+            backup = None
+            if target.exists():
+                backup = destination / f".{target.name}.prev"
+                os.replace(target, backup)
+            replaced.append((target, backup))
+            os.replace(part, target)
+    except (art.Refusal, Unverified):
+        clean_up()
         raise
-    for part, target in staged:
-        os.replace(part, target)
+    except OSError as error:
+        clean_up()
+        raise Unverified(f"the release folder could not be updated ({type(error).__name__})") from error
+    except BaseException:
+        clean_up()
+        raise
+    for _, backup in replaced:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
     return [target for _, target in staged]
 
 
@@ -374,13 +626,23 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
         tree_path, skip_tree = None, True
     else:
         skip_tree = False
-    sources = idx.load_sources(registry / "sources.json", declaration)
+    sources = idx.load_sources(registry / "sources.json", declaration, decl.cache_file(registry))
+    if (component in sources["repositories"] and cls and tree_path and not skip_tree
+            and cls != idx.repository_class(sources, component)):
+        own = f"{component}/{tree_path.strip('/')}"
+        warn(f"{component} --class {cls} --path {tree_path}: published as its own component {own} (class {cls}), "
+             f"so the {idx.repository_class(sources, component)} releases of {component} stay as they are and both "
+             f"are found in the index (declare it as `{own}: {cls}` in publication.classes)")
+        component = own
     info = gather(sources, root, component, version, cls, files_dir, tree_path, commit)
     if info is None:
         print(f"{component} {version}: status=skipped; nothing published; {len(decl.WARNINGS)} warning(s)")
         return 0
     if skip_tree:
         info.pop("tree_at", None)
+    if info.get("tree_at") and not sources.get("exclude_known", True):
+        warn(f"{component}: the paths the declaration excludes from archives are not known; no tree tar built")
+        info.pop("tree_at")
     artifacts_dir, index_path = registry / "artifacts", registry / "releases.json"
     destination = idx.release_dir(artifacts_dir, info["class"], component, version)
     written: list[Path] = []
@@ -388,6 +650,11 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
     exclude = sources.get("exclude") or []
     try:
         listing = payload_rows(info)
+        if files_dir is not None and info["class"] in ("runtime", "layer") and listing:
+            sums_check(files_dir, {e["name"]: e["sha256"] for e in listing})
+            bound = bind_release_files(component, version, info["tag_commit"], listing)
+            status = "skipped" if bound else "unverified"
+            listing = bound
         if info.get("tree_at"):
             row = tree_row(component, version, info, exclude)
             if row is not None:
@@ -395,13 +662,18 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
         if (info.get("tree_at") or info.get("archive")) and listing and not exclude:
             idx.warn_once(f"no archive exclusion is declared (publication.archive_exclude in {decl.WHERE}); "
                           "the archive holds every file of its tree")
-        if files_dir is not None and info["class"] in ("runtime", "layer"):
-            sums_check(files_dir, {e["name"]: e["sha256"] for e in listing})
         previous = idx.read_manifest(destination / "MANIFEST.json") or {}
         rows = (idx.manifest_artifacts(previous, str(destination / "MANIFEST.json")) or []) if previous else []
         old = {a["name"]: a for a in rows}
-        bind_to_previous(component, version, destination, listing, old)
-        if listing:
+        built = bool(listing)
+        listing = bind_to_previous(component, version, destination, listing, old)
+        bound_to = reference_disagrees(previous, info) if old else None
+        if bound_to and listing:
+            now = info.get("tag_commit") or info.get("commit")
+            warn(f"{component} {version}: already published from {bound_to[:12]}, and its source now names "
+                 f"{now[:12]}; the published binding is kept and nothing is written (cut a new version)")
+            listing = []
+        elif listing:
             merged = {**old, **{e["name"]: {k: v for k, v in e.items() if k != "src"} for e in listing}}
             for artifact in merged.values():
                 artifact["lfs"] = art.is_lfs(artifact["name"])
@@ -419,7 +691,9 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
             except Unverified as problem:
                 warn(f"{component} {version}: {problem}; nothing replaced, the release stays as it was")
                 status = "unverified"
-        else:
+        elif built:
+            warn(f"{component} {version}: nothing to write; the published release stays as it was")
+        elif status != "unverified":
             warn(f"{component} {version}: no artifact could be built; no MANIFEST.json written")
     except art.Refusal as refusal:
         print(f"refused: {refusal}; no live file changed", file=sys.stderr)
@@ -443,10 +717,8 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
     where = f"{len(written) - 1} artifact(s) in {destination}" if written else "no artifact published"
     print(f"{component} {version}: status={status}; {where}; index {index_path if index_written else 'unchanged'}; "
           f"{len(decl.WARNINGS)} warning(s)")
-    if commit_changes:
-        paths = ([index_path] if index_written else []) + ([destination] if destination.exists() else [])
-        lfs_names = [str(p.relative_to(registry)) for p in written]
-        if paths and commit_release(registry, paths, lfs_names, f"Publicación: {component} {version}"):
+    if commit_changes and (index_written or destination.exists()):
+        if commit_release(registry, index_path if index_written else None, destination, f"Publicación: {component} {version}"):
             print("committed")
     return 0
 

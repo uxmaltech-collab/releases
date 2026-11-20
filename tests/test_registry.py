@@ -65,12 +65,14 @@ def git(repo: Path, *args: str, date: str = "2026-01-02T03:04:05Z") -> str:
 class Repo:
     """A checkout as the scripts expect it: a default branch published as origin/HEAD."""
 
-    def __init__(self, root: Path, name: str):
-        self.path = root / name
+    def __init__(self, root: Path, name: str, owner: str | None = "example-org", folder: Path | None = None):
+        self.path = folder or root / name
         self.path.mkdir(parents=True)
         git(self.path, "init", "-q", "-b", "main")
         git(self.path, "config", "commit.gpgsign", "false")
         git(self.path, "config", "tag.gpgsign", "false")
+        if owner:  # the checkout's identity: what its origin remote names (never fetched: no network)
+            git(self.path, "remote", "add", "origin", f"https://example.test/{owner}/{name}.git")
 
     def commit(self, files: dict[str, str | bytes], message: str = "c", date: str = "2026-01-02T03:04:05Z") -> str:
         for name, content in files.items():
@@ -139,7 +141,7 @@ class Case(unittest.TestCase):
         return json.loads((self.registry / "releases.json").read_text())
 
     def sot(self, rows: str, version="0.1.2") -> Repo:
-        repo = Repo(self.root, "sot")
+        repo = Repo(self.root, "sot", owner="o")
         self.first = repo.commit({"containers/recipe/version.json": json.dumps({"component": "containers/recipe", "version": version,
                                                                               "released": "2026-02-03"}),
                                   "containers/recipe/README.md": "# r\n\n| Version | Commit | Notes |\n| --- | --- | --- |\n" + rows})
@@ -291,24 +293,41 @@ class Publish(Case):
         first = manifest_file.read_bytes()
         code, _ = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2", commit_changes=False)
         self.assertEqual((code, manifest_file.read_bytes()), (0, first))
+        # a stale recorded digest alone: the stored bytes are these, so the record is repaired
         tampered = json.loads(first)
         tampered["artifacts"][0]["sha256"] = "0" * 64
         manifest_file.write_text(json.dumps(tampered))
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2", commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("stale sha256", err)
+        self.assertEqual(json.loads(manifest_file.read_text())["artifacts"][0]["sha256"],
+                         json.loads(first)["artifacts"][0]["sha256"])
+        # stored bytes that differ from the rebuilt ones: an actual mismatch
+        tar = manifest_file.parent / "containers__recipe-0.1.2.tar"
+        tar.write_bytes(b"other bytes")
         before = (self.registry / "releases.json").read_bytes()
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2", commit_changes=False)
         self.assertEqual(code, 3)
-        self.assertIn("another sha256", err)
+        self.assertIn("other bytes", err)
+        self.assertEqual(tar.read_bytes(), b"other bytes")
         self.assertEqual((self.registry / "releases.json").read_bytes(), before)
+        # the stored file is gone and the record names other bytes: nothing proves which are right; the record stays
+        tar.unlink()
+        manifest_file.write_text(json.dumps(tampered))
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2", commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("recorded binding is kept", err)
+        self.assertEqual(json.loads(manifest_file.read_text())["artifacts"][0]["sha256"], "0" * 64)
+        self.assertFalse(tar.exists())
 
     def test_layer_files_are_copied_and_a_sums_mismatch_refuses(self):
-        repo = Repo(self.root, "a-sre")
+        repo = Repo(self.root, "a-sre", owner="o")
         repo.commit({"CHANGELOG.md": "## 0.1.0\n\nFirst.\n"})
         repo.tag("v0.1.0", "m")
         repo.publish_head()
         self.sources(repositories=["o/a-sre"], classes={"o/a-sre": "layer"})
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "collab-a-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+        files = release_files(self.tmp / "dist", {"collab-a-0.1.0-py3-none-any.whl": b"wheel"},
+                              git(repo.path, "rev-parse", "HEAD"), component="o/a-sre")
         digest = art.sha256_bytes(b"wheel")
         (files / "collab-a.SHA256SUMS").write_text(f"{digest}  collab-a-0.1.0-py3-none-any.whl\n")
         code, _ = self.run_quiet(pub.publish, self.registry, self.root, "o/a-sre", "v0.1.0", files_dir=files,
@@ -317,7 +336,8 @@ class Publish(Case):
         folder = self.registry / "artifacts/layer/o__a-sre/0.1.0"
         manifest = json.loads((folder / "MANIFEST.json").read_text())
         self.assertEqual({a["name"]: a["lfs"] for a in manifest["artifacts"]},
-                         {"collab-a-0.1.0-py3-none-any.whl": True, "collab-a.SHA256SUMS": False})
+                         {"collab-a-0.1.0-py3-none-any.whl": True, "collab-a.SHA256SUMS": False,
+                          "collab-example.component.json": False})
         self.assertEqual(manifest["requires"], [{"kind": "component", "name": "o/cli", "constraint": ">=0.3"}])
         self.assertEqual(manifest["tag_commit"], git(repo.path, "rev-parse", "HEAD"))
         self.assertEqual((folder / "collab-a-0.1.0-py3-none-any.whl").read_bytes(), b"wheel")
@@ -354,12 +374,12 @@ class Publish(Case):
         self.assertEqual(art.php_zip(repo.path, "v1.2.3"), art.php_zip(repo.path, "v1.2.3"))
 
     def test_unreadable_sources_warn_and_are_skipped_but_the_index_is_written(self):
-        repo = Repo(self.root, "present")
+        repo = Repo(self.root, "present", owner="o")
         repo.commit({"composer.json": "{}"})
         repo.tag("v1.0.0", "m")
         repo.publish_head()
         self.sources(repositories=["o/present", "o/absent", "o/notag"], classes={"o/present": "php-package"})
-        Repo(self.root, "notag").commit({"x": "1"})  # a checkout without origin/HEAD and without tags
+        Repo(self.root, "notag", owner="o").commit({"x": "1"})  # a checkout without origin/HEAD and without tags
         # build: the absent and the unpublished checkouts warn; the present one is indexed
         components, err = self.run_quiet(idx.build, self.root, idx.load_sources(self.registry / "sources.json"), self.registry / "artifacts")
         self.assertEqual(list(components), ["o/present"])
@@ -406,6 +426,20 @@ class Publish(Case):
         (self.registry / "a/x.zip").write_bytes(b"z")
         reason = pub.lfs_ready(self.registry, ["a/x.zip"])
         self.assertIsNotNone(reason)  # no .gitattributes for this temporary registry, or no git lfs here
+
+
+def release_files(folder: Path, files: dict[str, bytes], commit: str | None, component: str = "example-org/example-sre",
+                  version: str = "0.1.0", list_name: str = "collab-example.component.json") -> Path:
+    """A `--files` directory as the runtime's build writes it: the files, and the component release's asset list
+    (`collab.component-release/v1`) naming the repository, version and commit, with the sha256 of each file."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (folder / name).write_bytes(data)
+    record = {"id": "example", "repository": component, "version": version, "commit": commit}
+    listing = {"schema": "collab.component-release/v1", "component": record, "targets": [],
+               "files": [{"name": n, "sha256": art.sha256_bytes(d)} for n, d in sorted(files.items())]}
+    (folder / list_name).write_text(json.dumps(listing))
+    return folder
 
 
 def layer_repo(case: Case, name: str = "example-sre", tags=("v0.1.0",)) -> Repo:
@@ -557,8 +591,7 @@ class ReferenceNotCopy(Case):
         repo = self.sot("| 0.1.2 | tag `recipe-v0.1.2` | Third. |\n")
         repo.tag("recipe-v0.1.2")
         repo.publish_head()
-        self.sources(sot="example-org/example-sot")
-        (self.root / "example-sot").symlink_to(repo.path)
+        self.sources(sot="o/sot")
         with cli_absent():
             self.assertIsNone(art.cli_tree_digest())
             code, err = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2", commit_changes=False)
@@ -610,14 +643,13 @@ class FailOpen(Case):
         self.assertIn("`artifacts` is not a list", err)
         self.assertIn("not numeric", err)
         # the publisher reads the same malformed prior manifest and still publishes the version
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "new.whl").write_bytes(b"w")
+        files = release_files(self.tmp / "dist", {"new.whl": b"w"},
+                              git(self.root / "example-sre", "rev-parse", "v0.2.0^{commit}"), version="0.2.0")
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.2.0",
                                    files_dir=files, commit_changes=False)
         self.assertEqual(code, 0)
         names = [a["name"] for a in json.loads((base / "0.2.0/MANIFEST.json").read_text())["artifacts"]]
-        self.assertEqual(names, ["new.whl", "ok.whl"])
+        self.assertEqual(names, ["collab-example.component.json", "new.whl", "ok.whl"])
 
     def test_a_malformed_cached_entry_is_kept_as_it_was(self):
         layer_repo(self)
@@ -625,9 +657,7 @@ class FailOpen(Case):
         index = self.registry / "releases.json"
         odd = {"repository": "example-org/odd", "kind": "repository", "releases": None}
         index.write_text(json.dumps({"schema": "collab.releases/v2", "components": {"example-org/odd": odd}}))
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "a.whl").write_bytes(b"a")
+        files = release_files(self.tmp / "dist", {"a.whl": b"a"}, git(self.root / "example-sre", "rev-parse", "HEAD"))
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
                                    files_dir=files, commit_changes=False)
         self.assertEqual(code, 0)
@@ -642,11 +672,10 @@ class FailOpen(Case):
         self.assertIn("example-org/example-sre", components)
 
     def test_sums_evidence_warns_and_only_an_actual_mismatch_refuses(self):
-        layer_repo(self)
+        repo = layer_repo(self)
         self.sources(repositories=["example-org/example-sre"])
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "a.whl").write_bytes(b"a")
+        tag = git(repo.path, "rev-parse", "HEAD")
+        files = release_files(self.tmp / "dist", {"a.whl": b"a"}, tag)
         (files / "SHA256SUMS").write_text("not-a-sum  a.whl\njust-one-field\n")
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
                                    files_dir=files, commit_changes=False)
@@ -664,7 +693,7 @@ class FailOpen(Case):
         self.assertIn("no usable sha256", err)
         # a prior row without sha256 whose stored bytes differ: an actual mismatch
         (folder / "MANIFEST.json").write_text(json.dumps(manifest))
-        (files / "a.whl").write_bytes(b"other bytes")
+        release_files(files, {"a.whl": b"other bytes"}, tag)
         (files / "SHA256SUMS").write_text("")
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
                                    files_dir=files, commit_changes=False)
@@ -686,10 +715,7 @@ class FailOpen(Case):
         # an unreadable --files entry is skipped and its siblings are published
         layer = layer_repo(self, "example-sre")
         self.sources(repositories=["example-org/example-sre"])
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "good.whl").write_bytes(b"g")
-        (files / "bad.whl").write_bytes(b"b")
+        files = release_files(self.tmp / "dist", {"good.whl": b"g", "bad.whl": b"b"}, git(layer.path, "rev-parse", "HEAD"))
         real = art.sha256_file
 
         def failing(path):
@@ -709,11 +735,9 @@ class FailOpen(Case):
         self.assertIn("caf", entry["releases"][0]["changelog"])
 
     def test_staged_bytes_are_verified_before_live_files_change(self):
-        layer_repo(self)
+        repo = layer_repo(self)
         self.sources(repositories=["example-org/example-sre"])
-        files = self.tmp / "dist"
-        files.mkdir()
-        (files / "a.whl").write_bytes(b"a")
+        files = release_files(self.tmp / "dist", {"a.whl": b"a"}, git(repo.path, "rev-parse", "HEAD"))
         (files / "MANIFEST.json").write_text('{"forged": true}')
         code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
                                    files_dir=files, commit_changes=False)
@@ -731,7 +755,8 @@ class FailOpen(Case):
         self.assertEqual((folder / "a.whl").read_bytes(), b"a")
         self.assertEqual((folder / "MANIFEST.json").read_bytes(), manifest_before)
         self.assertEqual((self.registry / "releases.json").read_bytes(), index_before)
-        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["MANIFEST.json", "a.whl"])  # nothing staged is left
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["MANIFEST.json", "a.whl", "collab-example.component.json"])  # nothing staged is left
         # a failure on a first publication leaves no folder behind
         with mock.patch.object(art, "sha256_file", lambda path: "0" * 64 if Path(path).name.endswith(".part") else real(path)):
             code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
@@ -769,6 +794,308 @@ class FailOpen(Case):
         self.assertEqual(code, 0)
         self.assertEqual((self.registry / "releases.json.unreadable").read_text(), "{ truncated")
         self.assertIn("example-org/example-sre", self.index()["components"])
+
+
+
+FAKE_LFS_CLEAN = """import hashlib, sys
+data = sys.stdin.buffer.read()
+sys.stdout.write("version https://git-lfs.github.com/spec/v1\\noid sha256:%s\\nsize %d\\n" % (hashlib.sha256(data).hexdigest(), len(data)))
+"""
+
+
+class SecondReview(Case):
+    """Each scenario of the second review, reproduced first (each failed on de31513)."""
+
+    # blocker: --files bound to the requested release
+    def test_files_of_another_release_are_refused_and_unbound_files_are_not_advertised(self):
+        repo = layer_repo(self, tags=("v1.0.0",))
+        old = git(repo.path, "rev-parse", "v1.0.0^{commit}")
+        repo.commit({"x": "2"})
+        repo.tag("v2.0.0", "m")
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-sre"])
+        wheel = {"example_sre-1.0.0-py3-none-any.whl": b"wheel 1.0.0"}
+        files = release_files(self.tmp / "dist-1.0.0", wheel, old, version="1.0.0")
+        (files / "SHA256SUMS").write_text(f"{art.sha256_bytes(b'wheel 1.0.0')}  example_sre-1.0.0-py3-none-any.whl\n")
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "2.0.0",
+                                   files_dir=files, commit_changes=False)
+        self.assertEqual(code, 3)
+        self.assertIn("another release's", err)
+        self.assertFalse((self.registry / "artifacts").exists())
+        # an asset list of another repository is another release's too
+        other = release_files(self.tmp / "dist-other", wheel, git(repo.path, "rev-parse", "v2.0.0^{commit}"),
+                              component="example-org/example-other", version="2.0.0")
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "2.0.0",
+                                 files_dir=other, commit_changes=False)
+        self.assertEqual(code, 3)
+        # no asset list at all: nothing advertised, the index is still updated, exit 0
+        loose = self.tmp / "loose"
+        loose.mkdir()
+        (loose / "example_sre-2.0.0-py3-none-any.whl").write_bytes(b"wheel 2.0.0")
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "2.0.0",
+                                   files_dir=loose, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("holds no asset list of this release", err)
+        self.assertFalse((self.registry / "artifacts").exists())
+        by = {r["version"]: r for r in self.index()["components"]["example-org/example-sre"]["releases"]}
+        self.assertEqual(by["2.0.0"]["artifacts"], [])
+        # the release's own asset list binds its files; a file it does not list is not published
+        new = git(repo.path, "rev-parse", "v2.0.0^{commit}")
+        files = release_files(self.tmp / "dist-2.0.0", {"example_sre-2.0.0-py3-none-any.whl": b"wheel 2.0.0"}, new,
+                              version="2.0.0")
+        (files / "stray.txt").write_text("not released")
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "2.0.0",
+                                   files_dir=files, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("stray.txt: not in the asset list", err)
+        names = [a["name"] for a in self.index()["components"]["example-org/example-sre"]["releases"][0]["artifacts"]]
+        self.assertEqual(names, ["collab-example.component.json", "example_sre-2.0.0-py3-none-any.whl"])
+        # a listed file with other bytes than the asset list records is the wrong artifact
+        (files / "example_sre-2.0.0-py3-none-any.whl").write_bytes(b"tampered")
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "2.0.0",
+                                 files_dir=files, commit_changes=False)
+        self.assertEqual(code, 3)
+
+    # blocker: cached artifacts stay with the commit they were published from
+    def test_a_moved_tag_keeps_the_published_binding(self):
+        repo = Repo(self.root, "example-core")
+        first = repo.commit({"composer.json": json.dumps({"name": "example-org/example-core"})})
+        repo.tag("v1.0.0", "m")
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-core"], classes={"example-org/example-core": "php-package"})
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-core", "1.0.0", commit_changes=False)
+        self.assertEqual(code, 0)
+        published = self.index()["components"]["example-org/example-core"]["releases"][0]
+        moved = repo.commit({"composer.json": json.dumps({"name": "example-org/example-core", "x": 1})})
+        git(repo.path, "tag", "-f", "-a", "v1.0.0", "-m", "moved")
+        repo.publish_head()
+        sources = idx.load_sources(self.registry / "sources.json")
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", self.index()["components"])
+        (release,) = components["example-org/example-core"]["releases"]
+        self.assertIn("the published binding is kept", err)
+        self.assertEqual((release["commit"], release["tag_commit"]), (first, first))
+        self.assertNotEqual(release["commit"], moved)
+        self.assertEqual(release["artifacts"], published["artifacts"])
+        # publishing the moved tag again: other bytes for a published version are refused, nothing changes
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-core", "1.0.0", commit_changes=False)
+        self.assertEqual(code, 3)
+        # a manifest in a folder of another version or component is never attached
+        folder = self.registry / "artifacts/php-package/example-org__example-core/1.0.0"
+        manifest = json.loads((folder / "MANIFEST.json").read_text())
+        manifest["version"] = "9.9.9"
+        (folder / "MANIFEST.json").write_text(json.dumps(manifest))
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts")
+        self.assertEqual(components["example-org/example-core"]["releases"][0]["artifacts"], [])
+        self.assertIn("not of 1.0.0", err)
+
+    # blocker: a checkout is resolved by owner and name, and its identity checked
+    def test_a_checkout_of_another_owner_is_never_read(self):
+        Repo(self.root, "core", owner="example-a").commit({"composer.json": "{}"})
+        git(self.root / "core", "tag", "-a", "v1.0.0", "-m", "m")
+        Repo.publish_head(types.SimpleNamespace(path=self.root / "core"))
+        self.sources(repositories=["example-b/core"], classes={"example-b/core": "php-package"})
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-b/core", "1.0.0", commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("is of example-a/core, not of example-b/core", err)
+        self.assertFalse((self.registry / "artifacts").exists())
+        # the owner's own folder, <root>/<owner>/<name>, is read
+        mine = Repo(self.root, "core", owner="example-b", folder=self.root / "example-b" / "core")
+        mine.commit({"composer.json": json.dumps({"name": "example-b/core"})})
+        mine.tag("v1.0.0", "m")
+        mine.publish_head()
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-b/core", "1.0.0", commit_changes=False)
+        self.assertEqual(code, 0)
+        manifest = json.loads((self.registry / "artifacts/php-package/example-b__core/1.0.0/MANIFEST.json").read_text())
+        self.assertEqual(manifest["tag_commit"], git(mine.path, "rev-parse", "HEAD"))
+        # an origin with credentials in its URL: only owner/name is ever used, never printed
+        git(mine.path, "remote", "set-url", "origin", "https://user:EXAMPLE-NOT-A-SECRET@example.test/example-c/core.git")
+        _, err = self.run_quiet(idx.checkout, self.root, "example-b/core")
+        self.assertIn("example-c/core", err)
+        self.assertNotIn("EXAMPLE-NOT-A-SECRET", err)
+
+    # major: a --class override with --path is its own component, both found in the index
+    def test_a_service_of_a_php_package_repository_is_its_own_component(self):
+        repo = Repo(self.root, "example-core")
+        repo.commit({"composer.json": json.dumps({"name": "example-org/example-core"}), "service/run.sh": "#!/bin/sh\n"})
+        repo.tag("v1.0.0", "m")
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-core"], classes={"example-org/example-core": "php-package"})
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-core", "1.0.0", commit_changes=False)
+        self.assertEqual(code, 0)
+        with cli_installed():
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-core", "1.0.0",
+                                       cls="service", tree_path="service", commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("published as its own component example-org/example-core/service", err)
+        for components in (self.index()["components"],
+                           self.run_quiet(idx.build, self.root, idx.load_sources(self.registry / "sources.json"),
+                                          self.registry / "artifacts", self.index()["components"])[0]):
+            php, service = components["example-org/example-core"], components["example-org/example-core/service"]
+            self.assertEqual((php["class"], [a["name"] for a in php["releases"][0]["artifacts"]]),
+                             ("php-package", ["example-core-1.0.0.zip"]))
+            self.assertEqual((service["class"], service["repository"], service["kind"]),
+                             ("service", "example-org/example-core", "repository"))
+            self.assertEqual([a["name"] for a in service["releases"][0]["artifacts"]],
+                             ["example-org__example-core__service-1.0.0.tar"])
+            self.assertEqual(service["releases"][0]["tag_commit"], git(repo.path, "rev-parse", "HEAD"))
+        # a --class override without --path is found under the class it was published as
+        layer_repo(self)
+        self.sources(repositories=["example-org/example-sre"])
+        files = release_files(self.tmp / "dist", {"a.whl": b"a"}, git(self.root / "example-sre", "rev-parse", "HEAD"))
+        self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0", cls="runtime",
+                       files_dir=files, commit_changes=False)
+        release = self.index()["components"]["example-org/example-sre"]["releases"][0]
+        self.assertEqual((release["class"], [a["name"] for a in release["artifacts"]]),
+                         ("runtime", ["a.whl", "collab-example.component.json"]))
+
+    # major: only the release is staged, and LFS artifacts are verified as pointers
+    def lfs_registry(self, clean: str | None):
+        git(self.registry, "init", "-q", "-b", "main")
+        git(self.registry, "config", "commit.gpgsign", "false")
+        if clean is not None:
+            (self.registry / ".gitattributes").write_text("artifacts/**/*.whl filter=lfs diff=lfs merge=lfs -text\n")
+            git(self.registry, "config", "filter.lfs.clean", clean)
+            git(self.registry, "config", "filter.lfs.required", "true")
+
+    def test_a_retry_stages_only_the_release_and_never_a_plain_binary(self):
+        repo = layer_repo(self)
+        self.sources(repositories=["example-org/example-sre"])
+        self.lfs_registry(None)  # no LFS attribute: the first run leaves the wheel uncommitted
+        files = release_files(self.tmp / "dist", {"a.whl": b"wheel"}, git(repo.path, "rev-parse", "HEAD"))
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0", files_dir=files)
+        self.assertEqual(code, 0)
+        self.assertIn("not committed", err)
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0")
+        self.assertEqual(code, 0)
+        self.assertIn("not committed", err)
+        self.assertEqual(git(self.registry, "diff", "--cached", "--name-only"), "")
+        self.assertEqual(subprocess.run(["git", "-C", str(self.registry), "rev-parse", "-q", "--verify", "HEAD"],
+                                        capture_output=True).returncode, 1)
+
+    def test_lfs_artifacts_are_committed_only_as_pointers_to_their_bytes(self):
+        repo = layer_repo(self)
+        self.sources(repositories=["example-org/example-sre"])
+        files = release_files(self.tmp / "dist", {"a.whl": b"wheel"}, git(repo.path, "rev-parse", "HEAD"))
+        script = self.tmp / "fake-lfs-clean.py"
+        script.write_text(FAKE_LFS_CLEAN)
+        # a clean filter that stores the bytes as they are is not Git LFS: nothing is staged
+        self.lfs_registry("cat")
+        with mock.patch.object(pub, "lfs_ready", return_value=None):
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0", files_dir=files)
+        self.assertEqual(code, 0)
+        self.assertIn("ordinary blob", err)
+        self.assertEqual(git(self.registry, "diff", "--cached", "--name-only"), "")
+        # an (obviously fake) clean filter that writes the LFS pointer of the bytes: committed, with the stray file left out
+        git(self.registry, "config", "filter.lfs.clean", f"{sys.executable} -I {script}")
+        folder = self.registry / "artifacts/layer/example-org__example-sre/0.1.0"
+        (folder / "left-by-a-failed-run.bin").write_bytes(b"x")
+        with mock.patch.object(pub, "lfs_ready", return_value=None):
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0", files_dir=files)
+        self.assertEqual(code, 0)
+        committed = git(self.registry, "show", "--name-only", "--format=").splitlines()
+        self.assertIn("artifacts/layer/example-org__example-sre/0.1.0/a.whl", committed)
+        self.assertNotIn("artifacts/layer/example-org__example-sre/0.1.0/left-by-a-failed-run.bin", committed)
+        pointer = git(self.registry, "cat-file", "blob", "HEAD:artifacts/layer/example-org__example-sre/0.1.0/a.whl")
+        self.assertIn(f"oid sha256:{art.sha256_bytes(b'wheel')}", pointer)
+
+    # major: a failure while replacing leaves the release as it was
+    def test_a_failed_replacement_rolls_back(self):
+        repo = layer_repo(self)
+        self.sources(repositories=["example-org/example-sre"])
+        files = release_files(self.tmp / "dist", {"a.whl": b"a", "b.whl": b"b"}, git(repo.path, "rev-parse", "HEAD"))
+        folder = self.registry / "artifacts/layer/example-org__example-sre/0.1.0"
+        (folder / "b.whl").mkdir(parents=True)  # the second wheel's destination is a directory
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
+                                   files_dir=files, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("is not a regular file", err)
+        self.assertEqual([p.name for p in folder.iterdir()], ["b.whl"])  # nothing moved in, nothing staged left
+        (folder / "b.whl").rmdir()
+        self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0", files_dir=files,
+                       commit_changes=False)
+        before = {p.name: (p.read_bytes(), p.stat().st_ino) for p in folder.iterdir()}
+        # a rename that fails half way: every replaced live file is put back (the very same files)
+        real, calls = os.replace, []
+
+        def failing(src, dst):
+            calls.append(Path(dst).name)
+            if Path(dst).name == "b.whl" and Path(src).name.endswith(".part"):
+                raise OSError("disk full")
+            return real(src, dst)
+        with mock.patch.object(pub.os, "replace", failing):
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.1.0",
+                                       files_dir=files, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertIn("could not be updated", err)
+        self.assertIn("a.whl", calls)  # the first one was replaced before the failure
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_ino) for p in folder.iterdir()}, before)
+
+    # major: an unreadable declaration never lets an excluded path into an archive
+    def test_an_unreadable_declaration_uses_its_verified_copy_or_builds_no_archive(self):
+        repo = Repo(self.root, "example-service")
+        repo.commit({"app/run.sh": "#!/bin/sh\n", "governance/policy.yaml": "rule: theirs\n"})
+        repo.tag("v1.0.0", "m")
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-service"], classes={"example-org/example-service": "service"})
+        git(self.registry, "init", "-q", "-b", "main")
+        yaml_declaration = self.tmp / "release-adoption.yaml"
+        yaml_declaration.write_text("publication:\n  repositories: [example-org/example-service]\n"
+                                    "  classes: {example-org/example-service: service}\n  archive_exclude: [governance]\n")
+        folder = self.registry / "artifacts/service/example-org__example-service/1.0.0"
+        with mock.patch.dict(sys.modules, {"yaml": None}), cli_installed():  # a host without PyYAML
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-service", "1.0.0",
+                                       commit_changes=False, declaration=yaml_declaration)
+            self.assertEqual(code, 0)
+            self.assertIn("no archive is built", err)
+            self.assertFalse(folder.exists())
+            self.assertIn("example-org/example-service", self.index()["components"])
+            # once read (as its JSON rendering), the verified copy is kept and used when the file cannot be read
+            readable = self.declaration({"repositories": ["example-org/example-service"],
+                                         "classes": {"example-org/example-service": "service"},
+                                         "archive_exclude": ["governance"]})
+            sources, _ = self.run_quiet(idx.load_sources, self.registry / "sources.json", readable, pub.decl.cache_file(self.registry))
+            self.assertEqual((sources["origin"], sources["exclude"]), ("declaration", ["governance"]))
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-service", "1.0.0",
+                                       commit_changes=False, declaration=yaml_declaration)
+        self.assertEqual(code, 0)
+        self.assertIn("last verified copy", err)
+        names = [n for n, _, _ in art.read_tar((folder / "example-org__example-service-1.0.0.tar").read_bytes())]
+        self.assertEqual(names, ["app/run.sh"])
+        # bytes that do not match the provenance the canon reader wrote are not used either
+        Path(str(readable) + ".provenance.json").write_text(json.dumps({"sha256": "0" * 64}))
+        sources, err = self.run_quiet(idx.load_sources, self.registry / "sources.json", readable, pub.decl.cache_file(self.registry))
+        self.assertIn("do not match the sha256", err)
+        self.assertEqual((sources["origin"], sources["exclude"]), ("cache", ["governance"]))
+
+    # major: a component that cannot be read keeps its history
+    def test_an_unreadable_version_json_keeps_the_component(self):
+        repo = self.sot("| 0.1.2 | tag `recipe-v0.1.2` | Third. |\n")
+        repo.tag("recipe-v0.1.2")
+        repo.publish_head()
+        self.sources(sot="o/sot")
+        sources = idx.load_sources(self.registry / "sources.json")
+        previous, _ = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts")
+        repo.commit({"containers/recipe/version.json": "{ not json"})
+        repo.publish_head()
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", previous)
+        self.assertIn("version.json is not JSON", err)
+        self.assertEqual(components["containers/recipe"], previous["containers/recipe"])
+
+    # major: a partial checkout keeps the commit resolved before
+    def test_an_unresolvable_tag_keeps_the_resolved_commit(self):
+        repo = self.sot("| 0.1.2 | tag `recipe-v0.1.2` | Third. |\n")
+        repo.tag("recipe-v0.1.2")
+        repo.publish_head()
+        self.sources(sot="o/sot")
+        sources = idx.load_sources(self.registry / "sources.json")
+        previous, _ = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts")
+        resolved = previous["containers/recipe"]["releases"][0]
+        self.assertIsNotNone(resolved["commit"])
+        git(repo.path, "tag", "-d", "recipe-v0.1.2")  # a fetch without that tag
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", previous)
+        release = components["containers/recipe"]["releases"][0]
+        self.assertEqual((release["commit"], release["tag_commit"]), (resolved["commit"], resolved["tag_commit"]))
+        self.assertIn("previously resolved", err)
 
 
 if __name__ == "__main__":

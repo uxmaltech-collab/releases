@@ -19,10 +19,19 @@ Per release it writes: version, date, changelog, commit (v1 fields, unchanged) a
   date. Changelog: the `## X.Y.Z` section of CHANGELOG.md on the default branch, else the tag message. A
   version with a published manifest and no tag (a repository that does not tag) is a release too.
 
+- Sub-components `<owner>/<name>/<path>` of a declared repository (declared in `classes`, or already published):
+  one release per published manifest.
+
+A checkout is `<root>/<owner>/<name>` or `<root>/<name>`, and only one whose `origin` remote names that repository
+is read (another repository with the same name is never labelled as this one).
+
 What cannot be read is reported on stderr and skipped; the index is still written. A source whose checkout is
-missing, or whose declaration is bad, keeps the entries the previous index had for it, and every version a fresh
-read does not give is kept from the previous index, so a partial run never loses history. An index that cannot be
-read is copied aside (`releases.json.unreadable`) before it is rebuilt. Exit status 0.
+missing, whose declaration is bad, or that cannot be read this time (a version.json that is not JSON, no tag
+read), keeps the entries the previous index had for it, and every version a fresh read does not give is kept from
+the previous index, so a partial run never loses history. A row whose commit this read cannot resolve keeps the
+one resolved before. A published version keeps the reference its manifest is bound to: when the source now names
+another commit (a moved tag) it warns and the row keeps the published commit with its artifacts. An index that
+cannot be read is copied aside (`releases.json.unreadable`) before it is rebuilt. Exit status 0.
 """
 from __future__ import annotations
 
@@ -140,30 +149,53 @@ def _read_sources_file(path: Path) -> dict | None:
     return raw
 
 
-def load_sources(path: Path, declaration: str | Path | None = None) -> dict:
-    """What the publisher publishes: `{sot, repositories, classes, vendors, exclude, invalid, readable, origin}`.
+def load_sources(path: Path, declaration: str | Path | None = None, cache: Path | None = None) -> dict:
+    """What the publisher publishes: `{sot, repositories, classes, vendors, exclude, exclude_known, invalid,
+    readable, origin}`.
 
-    The organization's declaration (`--declaration` / COLLAB_RELEASES_DECLARATION) is read when given; without it
-    (or when it cannot be read, or declares no `publication`) `sources.json` is read as before, with a warning that
-    says where the declaration belongs. A bad entry warns and is skipped (`invalid`); the rest is read.
-    `readable` is False when nothing could be read at all: callers then keep everything they had.
+    The organization's declaration (`--declaration` / COLLAB_RELEASES_DECLARATION) is read when given; when it
+    cannot be read (or its `publication` is malformed) the last verified copy in `cache` is used, with a warning.
+    Without a declaration (or with no verified copy, or when it declares no `publication`) `sources.json` is read
+    as before, with a warning that says where the declaration belongs. A bad entry warns and is skipped
+    (`invalid`); the rest is read. `readable` is False when nothing could be read at all: callers then keep
+    everything they had. `exclude_known` is False when a declaration was given and which paths it excludes from
+    archives cannot be known (it could not be read, its `archive_exclude` is malformed, and there is no verified
+    copy): no archive is built then, so a path the organization excludes is never packed.
     """
     declared_path = decl.path_from(declaration)
-    data = decl.read(declared_path) if declared_path else None
-    chosen, origin = None, "none"
+    data, digest = decl.read_with_digest(declared_path) if declared_path else (None, None)
+    origin, exclude_known = "none", True
+    if declared_path is not None:
+        well_formed = data is not None and decl.exclusions(data.get("publication")) is not None
+        if well_formed:
+            decl.remember(cache, declared_path, digest, data)
+        else:
+            cached = decl.recall(cache)
+            if cached is not None and decl.exclusions(cached["data"].get("publication")) is not None:
+                warn(f"{declared_path}: using the last verified copy of the declaration (sha256 "
+                     f"{str(cached.get('sha256'))[:12]}, read {cached.get('read_at')}, {decl.age(cached.get('read_at'))})")
+                data, origin = cached["data"], "cache"
+            else:
+                if data is not None:
+                    warn(f"{declared_path}: `publication` or its `archive_exclude` is malformed")
+                warn(f"{declared_path}: no verified copy of the declaration is kept here; which paths it excludes "
+                     "from archives is not known, so no archive is built (the index is still updated)")
+                exclude_known = False
+    chosen = None
     if data is not None:
         chosen = decl.publication(data, declared_path)
-        origin = "declaration" if chosen is not None else origin
-        if chosen is None:
+        origin = (origin if origin == "cache" else "declaration") if chosen is not None else origin
+        if chosen is None and data.get("publication") is None:
             warn(f"{declared_path}: declares no `publication`; reading {path} as before")
     if chosen is None:
         warn(f"the publisher's choices are read from {path}; they belong in {decl.WHERE}")
         chosen = _read_sources_file(path)
         origin = "sources" if chosen is not None else "none"
-    where = str(declared_path) if origin == "declaration" else str(path)
+    where = str(declared_path) if origin in ("declaration", "cache") else str(path)
+    excluded = decl.exclusions(chosen) if chosen is not None else []
     sources = {"sot": None, "repositories": [], "classes": {}, "invalid": set(), "readable": chosen is not None,
                "origin": origin, "vendors": decl.vendors(data, declared_path),
-               "exclude": decl.string_list(f"{where}: archive_exclude", (chosen or {}).get("archive_exclude")) or []}
+               "exclude": excluded or [], "exclude_known": exclude_known and excluded is not None}
     chosen = chosen or {}
     sot = chosen.get("sot")
     if sot is not None and not safe_repository(sot):
@@ -208,15 +240,71 @@ def component_class(sources: dict, component: str) -> str:
     return sources["classes"].get(component) or sot_class(component)
 
 
+def origin_identity(path: Path) -> str | None:
+    """The `owner/name` the checkout's `origin` remote names (the last two segments of its URL), or None. The URL
+    itself is never printed or returned: it may carry credentials."""
+    url = (git(path, "config", "--get", "remote.origin.url") or "").strip()
+    if not url:
+        return None
+    if "://" in url:
+        rest = url.split("://", 1)[1]
+        rest = rest.split("/", 1)[1] if "/" in rest else ""
+    elif re.match(r"^[^/\\]+:", url):  # scp-like `host:owner/name`
+        rest = url.split(":", 1)[1]
+    else:  # a local path
+        rest = url
+    rest = rest.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
+    parts = [p for p in rest.split("/") if p]
+    if len(parts) < 2:
+        return None
+    name = parts[-1][:-4] if parts[-1].endswith(".git") else parts[-1]
+    return f"{parts[-2]}/{name}" if safe_segment(parts[-2]) and safe_segment(name) else None
+
+
 def checkout(root: Path, repository: str) -> Path | None:
+    """The checkout of `owner/name`: `<root>/<owner>/<name>`, else `<root>/<name>`, and only one whose own top
+    level holds origin/HEAD and whose `origin` remote names this repository. A checkout of another repository with
+    the same name, or one whose origin names no repository, is not read (it warns): its tags would be labelled as
+    another repository's."""
     if not safe_repository(repository):
         warn(f"{repository!r}: not `owner/name`; no checkout read")
         return None
-    path = root / repository.split("/", 1)[1]
-    if git(path, "rev-parse", "--verify", "-q", "origin/HEAD") is None:
-        warn(f"{repository}: no checkout with origin/HEAD at {path}")
-        return None
-    return path
+    owner, name = repository.split("/")
+    seen = []
+    for path in (root / owner / name, root / name):
+        if not path.is_dir() or git(path, "rev-parse", "--verify", "-q", "origin/HEAD") is None:
+            continue
+        top = (git(path, "rev-parse", "--show-toplevel") or "").strip()
+        if not top or Path(top).resolve() != path.resolve():
+            continue  # a folder inside another checkout, not a checkout of its own
+        seen.append(path)
+        found = origin_identity(path)
+        if found is None:
+            warn(f"{repository}: the checkout at {path} has no `origin` remote that names a repository; it is not "
+                 f"read (it cannot be shown to be {repository})")
+        elif found.lower() != repository.lower():
+            warn(f"{repository}: the checkout at {path} is of {found}, not of {repository}; it is not read")
+        else:
+            return path
+    if not seen:
+        warn(f"{repository}: no checkout with origin/HEAD at {root / owner / name} or {root / name}")
+    return None
+
+
+def same_commit(one, two) -> bool:
+    """Two commit references name the same commit: equal, or one an abbreviation (7+ hex) of the other."""
+    if not (isinstance(one, str) and isinstance(two, str)) or min(len(one), len(two)) < 7:
+        return False
+    one, two = one.lower(), two.lower()
+    return one.startswith(two) or two.startswith(one)
+
+
+def parent_repository(sources: dict, component: str) -> str | None:
+    """The declared repository a sub-component key `<owner>/<name>/<path>` belongs to, or None."""
+    parts = component.split("/") if isinstance(component, str) else []
+    if len(parts) > 2 and "/".join(parts[:2]) in sources["repositories"]:
+        return "/".join(parts[:2])
+    return None
 
 
 def tag_commit(path: Path, name: str) -> str | None:
@@ -249,9 +337,19 @@ def sot_releases(path: Path, component: str) -> dict:
     return releases
 
 
-def sot_components(repository: str, path: Path, only: str | None = None, sources: dict | None = None) -> dict:
+def sot_components(repository: str, path: Path, only: str | None = None, sources: dict | None = None,
+                   failed: set | None = None) -> dict:
+    """The SoT's components. A component that cannot be read (its version.json is not JSON, or has no version
+    label) is added to `failed`, and so is `*` when the tree itself cannot be listed: callers keep their previous
+    entries, because a read that failed is never a reason to drop history."""
+    failed = failed if failed is not None else set()
     out = {}
-    files = (git(path, "ls-tree", "-r", "--name-only", "origin/HEAD") or "").splitlines()
+    listing = git(path, "ls-tree", "-r", "--name-only", "origin/HEAD")
+    if listing is None:
+        warn(f"{repository}: the tree of origin/HEAD cannot be listed; its components are not read")
+        failed.add("*")
+        return out
+    files = listing.splitlines()
     for vfile in sorted(f for f in files if f.endswith("/version.json")):
         component = vfile[: -len("/version.json")]
         if only is not None and component != only:
@@ -261,12 +359,15 @@ def sot_components(repository: str, path: Path, only: str | None = None, sources
         try:
             meta = json.loads(git(path, "show", f"origin/HEAD:{vfile}") or "")
         except ValueError:
-            warn(f"{component}: version.json is not JSON")
+            warn(f"{component}: version.json is not JSON; its previous entry is kept")
+            failed.add(component)
             continue
-        if not isinstance(meta, dict) or not isinstance(meta.get("version"), str):
-            continue
-        if meta.get("component") not in (None, component):
+        if isinstance(meta, dict) and meta.get("component") not in (None, component):
             continue  # a schema version file, not a component's
+        if not isinstance(meta, dict) or not isinstance(meta.get("version"), str):
+            warn(f"{component}: version.json has no version label; its previous entry is kept")
+            failed.add(component)
+            continue
         releases = sot_releases(path, component)
         latest = meta["version"]
         if latest not in releases:
@@ -321,24 +422,69 @@ def repository_component(repository: str, path: Path | None, cls: str, artifacts
             commit = tag_commit(path, name)
             releases[version] = {"version": version, "date": date or None, "changelog": text, "commit": commit,
                                  "class": cls, "repository": repository, "tag_commit": commit}
-    # A published release the repository has no tag for (it does not tag): the manifest is its row.
+    # A published release the repository has no tag for (it does not tag): the manifest is its row. The declared
+    # class is looked at first; a version published under another class (`--class`) is found there.
     if artifacts is not None:
-        base = artifacts / cls / slug(repository)
-        for manifest_file in sorted(base.glob("*/MANIFEST.json")) if base.is_dir() else []:
-            manifest = read_manifest(manifest_file)
-            version = manifest.get("version") if manifest else None
-            if manifest and not isinstance(version, str):
-                warn(f"{manifest_file}: no version label; skipped")
-            if isinstance(version, str) and version not in releases:
-                releases[version] = {"version": version, "date": _text(manifest.get("date")), "changelog": "",
-                                     "commit": _text(manifest.get("commit")), "class": cls, "repository": repository,
-                                     "tag_commit": _text(manifest.get("tag_commit"))}
+        for row in manifest_rows(artifacts, repository, repository, cls):
+            if row["version"] not in releases:
+                releases[row["version"]] = row
     if not releases:
         warn(f"{repository}: no vX.Y.Z tag and no published manifest")
         return None
     ordered = sorted(releases.values(), key=lambda r: key(r["version"]), reverse=True)
     return {"repository": repository, "kind": "repository", "class": cls, "latest": ordered[0]["version"],
             "releases": ordered}
+
+
+def manifest_rows(artifacts: Path, component: str, repository: str, cls: str) -> list[dict]:
+    """A release row for every published MANIFEST.json of `component`, in its declared class first and then in any
+    other class. A manifest that names another component or another version than its folder is not one of them."""
+    rows, seen = [], set()
+    for folder_class in (cls, *[c for c in CLASSES if c != cls]):
+        base = artifacts / folder_class / slug(component)
+        for manifest_file in sorted(base.glob("*/MANIFEST.json")) if base.is_dir() else []:
+            manifest = read_manifest(manifest_file)
+            if not manifest:
+                continue
+            version = manifest.get("version")
+            if not isinstance(version, str):
+                warn(f"{manifest_file}: no version label; skipped")
+                continue
+            if not manifest_belongs(manifest, component, manifest_file.parent.name, str(manifest_file)) or version in seen:
+                continue
+            seen.add(version)
+            rows.append({"version": version, "date": _text(manifest.get("date")), "changelog": "",
+                         "commit": _text(manifest.get("commit")), "class": folder_class, "repository": repository,
+                         "tag_commit": _text(manifest.get("tag_commit"))})
+    return rows
+
+
+def manifest_belongs(manifest: dict, component: str, version: str, where: str) -> bool:
+    """A manifest is the one of `component` `version` unless it names another one (it then warns and is not used:
+    its artifacts would be advertised under a release they do not belong to)."""
+    named, label = manifest.get("component"), manifest.get("version")
+    if isinstance(named, str) and named != component:
+        warn(f"{where}: the manifest is of {named}, not of {component}; not used")
+        return False
+    if isinstance(label, str) and label != version:
+        warn(f"{where}: the manifest is of version {label}, not of {version}; not used")
+        return False
+    return True
+
+
+def find_manifest(artifacts: Path, cls: str, component: str, version: str) -> tuple[dict | None, str]:
+    """`(manifest, class)` of one release: in its own class's folder, else (a `--class` override) in the one other
+    class that has it. `(None, cls)` when no manifest is published."""
+    own = release_dir(artifacts, cls, component, version) / "MANIFEST.json"
+    if own.exists():
+        return read_manifest(own), cls
+    for other in CLASSES:
+        path = release_dir(artifacts, other, component, version) / "MANIFEST.json"
+        if other != cls and path.exists():
+            manifest = read_manifest(path)
+            if manifest is not None:
+                return manifest, other
+    return None, cls
 
 
 def read_manifest(path: Path) -> dict | None:
@@ -382,11 +528,18 @@ def attach_manifests(components: dict, artifacts: Path, previous: dict | None = 
         if isinstance(prior, dict) and isinstance(prior.get("releases"), list):
             before = {r["version"]: r for r in prior["releases"] if isinstance(r, dict) and isinstance(r.get("version"), str)}
         for release in entry["releases"]:
-            held = {**before.get(release["version"], {}), **release}
+            prior_release = before.get(release["version"], {})
+            keep_resolved_reference(component_key, release, prior_release)
+            held = {**prior_release, **release}
             manifest = None
             if safe_segment(release["version"]) and release.get("class") in CLASSES:
-                manifest_path = release_dir(artifacts, release["class"], component_key, release["version"]) / "MANIFEST.json"
-                manifest = read_manifest(manifest_path)
+                manifest, found_class = find_manifest(artifacts, release["class"], component_key, release["version"])
+                where = f"{component_key} {release['version']}"
+                if manifest is not None and not manifest_belongs(manifest, component_key, release["version"], where):
+                    manifest = None
+                if manifest is not None:
+                    release["class"] = found_class
+                    keep_published_binding(component_key, release, manifest)
             else:
                 warn(f"{component_key} {release['version']!r}: cannot name a release folder; its manifest is not read")
             listed = manifest_artifacts(manifest, f"{component_key} {release['version']}") if manifest else None
@@ -405,6 +558,41 @@ def attach_manifests(components: dict, artifacts: Path, previous: dict | None = 
                 release["package"] = manifest["package"]
             elif isinstance(held.get("package"), str):
                 release["package"] = held["package"]
+
+
+REFERENCE_FIELDS = ("commit", "tag_commit", "date")
+
+
+def keep_resolved_reference(component_key: str, release: dict, prior: dict) -> None:
+    """A fresh row whose reference this read could not resolve (a checkout without the tag its README row names)
+    keeps the commit, tag_commit and date the previous index resolved for the same version."""
+    if release.get("commit") is not None or not isinstance(prior.get("commit"), str):
+        return
+    warn(f"{component_key} {release['version']}: its commit cannot be resolved by this read; the previously resolved "
+         f"{prior['commit'][:12]} is kept")
+    for field in REFERENCE_FIELDS:
+        if release.get(field) is None and isinstance(prior.get(field), str):
+            release[field] = prior[field]
+
+
+def keep_published_binding(component_key: str, release: dict, manifest: dict) -> None:
+    """The artifacts of a published version are bound to the reference its manifest recorded. When a fresh read of
+    the source names another commit for the version (a tag moved), the row keeps the published binding (commit,
+    tag_commit, date of the manifest) and warns: the cached bytes are never advertised under another commit."""
+    field = "tag_commit" if isinstance(manifest.get("tag_commit"), str) and isinstance(release.get("tag_commit"), str) else "commit"
+    bound, fresh = manifest.get(field), release.get(field)
+    if isinstance(bound, str) and isinstance(fresh, str) and not same_commit(bound, fresh):
+        warn(f"{component_key} {release['version']}: the source now names {fresh[:12]}, but the version was published "
+             f"from {bound[:12]}; the published binding is kept (a published version takes no other bytes: cut a new one)")
+        for name in REFERENCE_FIELDS:
+            if isinstance(manifest.get(name), str):
+                release[name] = manifest[name]
+            elif name != "date":
+                release[name] = None
+    elif release.get("commit") is None:
+        for name in REFERENCE_FIELDS:
+            if release.get(name) is None and isinstance(manifest.get(name), str):
+                release[name] = manifest[name]
 
 
 def usable_entry(component_key, entry) -> bool:
@@ -444,9 +632,60 @@ def merge_history(component_key: str, fresh: dict, prior) -> dict:
     return {**fresh, "releases": ordered, "latest": ordered[0]["version"]}
 
 
+TREE_CLASSES = ("service", "image-recipe", "sot-component")
+
+
+def subcomponent_class(sources: dict, component: str, artifacts: Path | None = None) -> str | None:
+    """The class of a sub-component `<owner>/<name>/<path>`: the declared one, else the class it was published as."""
+    declared = sources["classes"].get(component)
+    if declared:
+        return declared
+    for cls in CLASSES:
+        base = artifacts / cls / slug(component) if artifacts is not None else None
+        if base is not None and base.is_dir() and any(base.glob("*/MANIFEST.json")):
+            return cls
+    return None
+
+
+def subcomponents(sources: dict, artifacts: Path) -> list[str]:
+    """Sub-component keys of the declared repositories: the ones `classes` declares (`<owner>/<name>/<path>`) and
+    the ones already published (a manifest whose `component` is such a key)."""
+    found = {k for k in sources["classes"] if parent_repository(sources, k)}
+    for repository in sources["repositories"]:
+        prefix = slug(repository) + "__"
+        for class_dir in (d for d in sorted(artifacts.iterdir()) if d.is_dir()) if artifacts.is_dir() else []:
+            for folder in sorted(class_dir.glob(prefix + "*")):
+                for manifest_file in sorted(folder.glob("*/MANIFEST.json")):
+                    manifest = read_manifest(manifest_file) or {}
+                    named = manifest.get("component")
+                    if isinstance(named, str) and slug(named) == folder.name and parent_repository(sources, named) == repository:
+                        found.add(named)
+                        break
+    return sorted(found)
+
+
+def subcomponent_entry(component: str, repository: str, path: Path | None, cls: str | None, artifacts: Path) -> dict | None:
+    """The entry of a sub-component: one release per published manifest (it is published from its repository's tag
+    or a `--commit`), with the changelog section of its repository when the checkout is here."""
+    rows = manifest_rows(artifacts, component, repository, cls or "service")
+    if not rows:
+        return None
+    sections = changelog_sections(git(path, "show", "origin/HEAD:CHANGELOG.md") or "") if path is not None else {}
+    for row in rows:
+        row["changelog"] = sections.get(row["version"], "")
+    ordered = sorted(rows, key=lambda r: key(r["version"]), reverse=True)
+    return {"repository": repository, "kind": "repository", "class": cls or ordered[0]["class"],
+            "latest": ordered[0]["version"], "releases": ordered}
+
+
 def read_component(root: Path, sources: dict, component: str, artifacts: Path, previous: dict | None = None) -> dict | None:
-    """The fresh index entry of one component (a repository `owner/repo` or a SoT path), or None."""
-    if component in sources["repositories"]:
+    """The fresh index entry of one component (a repository `owner/repo`, one of its sub-components
+    `owner/repo/<path>`, or a SoT path), or None."""
+    parent = parent_repository(sources, component)
+    if parent is not None:
+        path = checkout(root, parent)
+        entry = subcomponent_entry(component, parent, path, subcomponent_class(sources, component, artifacts), artifacts)
+    elif component in sources["repositories"]:
         path = checkout(root, component)
         entry = repository_component(component, path, repository_class(sources, component), artifacts)
     elif sources["sot"] and component not in sources["invalid"]:
@@ -469,19 +708,29 @@ def build(root: Path, sources: dict, artifacts: Path, previous: dict | None = No
         warn("nothing could be read about what to publish; every previous entry is kept")
         kept.update(previous)
     sot = checkout(root, sources["sot"]) if sources["sot"] else None
+    failed: set = set()
     if sot is not None:
-        fresh.update(sot_components(sources["sot"], sot, sources=sources))
+        fresh.update(sot_components(sources["sot"], sot, sources=sources, failed=failed))
     for k, entry in previous.items():
         if isinstance(entry, dict) and entry.get("kind") == "sot" and k not in fresh:
-            if sot is None or k in sources["invalid"]:
+            if sot is None or k in sources["invalid"] or k in failed or "*" in failed:
                 kept[k] = entry
+    paths = {}
     for repository in sources["repositories"]:
-        path = checkout(root, repository)
+        path = paths[repository] = checkout(root, repository)
         entry = repository_component(repository, path, repository_class(sources, repository), artifacts)
         if entry is not None:
             fresh[repository] = entry
-        elif path is None and repository in previous:
-            kept[repository] = previous[repository]
+        elif repository in previous:
+            kept[repository] = previous[repository]  # nothing read this time is never a reason to drop history
+    for component in subcomponents(sources, artifacts):
+        parent = parent_repository(sources, component)
+        entry = subcomponent_entry(component, parent, paths.get(parent), subcomponent_class(sources, component, artifacts), artifacts)
+        if entry is not None:
+            fresh[component] = entry
+    for k, entry in previous.items():
+        if k not in fresh and parent_repository(sources, k):
+            kept[k] = entry  # a sub-component whose manifests cannot be read this time
     for k in sources["invalid"]:
         if k in previous and k not in fresh:
             kept[k] = previous[k]
@@ -561,7 +810,8 @@ def main(argv: list[str] | None = None) -> int:
     previous, state = load_index(args.out)
     if state == "unreadable":
         preserve(args.out)
-    components = build(args.root, load_sources(args.sources, args.declaration), args.artifacts, previous)
+    sources = load_sources(args.sources, args.declaration, decl.cache_file(args.out.parent))
+    components = build(args.root, sources, args.artifacts, previous)
     write_index(args.out, components)
     print(f"{args.out}: {len(components)} components, {count_releases(components)} releases, "
           f"{len(decl.WARNINGS)} warning(s)")
