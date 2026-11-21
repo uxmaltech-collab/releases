@@ -18,12 +18,14 @@ What it builds, by class (`--class` overrides the declared one):
 - runtime, layer: the released files of the version, copied from the directory given with `--files` (wheels,
   `*.component.json`, `*SHA256SUMS`, `install.py`, lock, manifest, notes). The sums files are checked, and the
   files are bound to the release by its own asset list (a `collab.component-release/v1` `*.component.json` or a
-  `collab.release/v*` `release-manifest.json` that names this repository and the tag's commit): only the files it
-  lists, with the sha256 it records, are published. Without such a list nothing from `--files` is published under
+  `collab.release/v*` `release-manifest.json` that names this repository, this version and, when the release has
+  a tag, the tag's commit; a list that omits one of them binds nothing): only the files it lists, with the sha256
+  it records, are published. Without such a list nothing from `--files` is published under
   the version (it warns; the index is still updated). A directory whose every asset list names another release
   is refused.
 - sot-component, image-recipe: the tree tar of the component's directory at the commit of its row in the
-  README release table (`--commit` overrides), with its `tree_digest` (from the installed cli).
+  README release table (`--commit` overrides a row without a tag; with a tag it can only name the tag's commit,
+  another is a refusal), with its `tree_digest` (from the installed cli).
 - service, and an image-recipe of a repository other than the SoT: the tree tar of `--path` (default: the whole
   tree) at the tag's commit or `--commit`.
 - a sub-component `<owner>/<name>/<path>` of a declared repository (declared in `publication.classes`, or
@@ -42,8 +44,8 @@ cannot be read (an undeclared component, no checkout, no tag, no `composer.json`
 file, a malformed sums line, a commit that is not on the default branch) warns on stderr and is skipped; the
 index is rewritten anyway, keeping every version it had. Every byte is staged and verified, and every destination
 checked, before any live file is replaced; a failure while replacing puts the replaced files back. The only
-refusal is the wrong artifact: a well-formed sum that is not the file's, `--files` of another release, a version
-whose stored bytes differ from the rebuilt ones, a copy or a tar that does not read back as built. Then no live file
+refusal is the wrong artifact: a well-formed sum that is not the file's, `--files` of another release, a
+`--commit` that is not the commit of the release's tag, a version whose stored bytes differ from the rebuilt ones, a copy or a tar that does not read back as built. Then no live file
 changes and the exit status is 3. A stale sha256 in a manifest whose stored bytes are these is repaired with a
 warning. Everything else exits 0.
 
@@ -191,34 +193,39 @@ def asset_list(entry: dict) -> dict | None:
 def bind_release_files(component: str, version: str, tag_commit: str | None, listing: list[dict]) -> list[dict]:
     """The `--files` entries that belong to `component` `version`, by the release's own asset list.
 
-    An asset list binds when it names this repository and the commit of the tag (or, with no tag to compare, this
-    version). Every file it lists must have the sha256 it records; a sums file binds when every file it lists is
-    bound. When every asset list in the directory names another release (another repository, commit or version),
-    the directory is another release's: a Refusal. With no asset list that can bind, nothing is published under the
-    version (it warns: the index is still updated and keeps what it had)."""
+    An asset list binds when it names this repository AND this version AND (when the release has a tag) the commit
+    of the tag. A commit alone is not a release (two tags can point at one commit), a version alone is not one
+    either (it says nothing of where the files were built), and a list that omits the repository, the version or
+    the tag's commit binds nothing. Every file it lists must have the sha256 it records; a sums file binds when
+    every file it lists is bound. When every asset list that names a release names another one (another repository,
+    commit or version), the directory is another release's: a Refusal. With no asset list that can bind, nothing is
+    published under the version (it warns: the index is still updated and keeps what it had)."""
     agreeing, other = [], []
     for entry in listing:
         found = asset_list(entry)
         if found is None:
             continue
-        if found["repository"] and found["repository"].lower() != component.lower():
+        if not found["repository"]:
+            warn(f"{entry['name']}: an asset list that names no repository; it binds nothing")
+        elif found["repository"].lower() != component.lower():
             other.append(f"{entry['name']} is the asset list of {found['repository']}")
-        elif tag_commit and found["commit"]:
-            if idx.same_commit(found["commit"], tag_commit):
-                agreeing.append((entry, found))
-            else:
-                other.append(f"{entry['name']} lists the files of commit {found['commit'][:12]}, not of the tag "
-                             f"v{version} ({tag_commit[:12]})")
-        elif found["versions"]:
-            if version in found["versions"]:
-                if not tag_commit:
-                    warn(f"{entry['name']}: bound to {component} {version} by its version only (there is no tag "
-                         "commit to compare with)")
-                agreeing.append((entry, found))
-            else:
-                other.append(f"{entry['name']} lists the files of version {', '.join(sorted(found['versions']))}")
+        elif not found["versions"]:
+            warn(f"{entry['name']}: an asset list that names no version; it binds nothing (a commit can carry "
+                 "several tags, so it does not tell which release the files are)")
+        elif found["versions"] != {version}:
+            other.append(f"{entry['name']} lists the files of version {', '.join(sorted(found['versions']))}, "
+                         f"not of {version}")
+        elif tag_commit and not found["commit"]:
+            warn(f"{entry['name']}: an asset list that names no commit; it binds nothing to the tag v{version} "
+                 f"({tag_commit[:12]})")
+        elif tag_commit and not idx.same_commit(found["commit"], tag_commit):
+            other.append(f"{entry['name']} lists the files of commit {found['commit'][:12]}, not of the tag "
+                         f"v{version} ({tag_commit[:12]})")
         else:
-            warn(f"{entry['name']}: an asset list that names neither a commit nor a version; it binds nothing")
+            if not tag_commit:
+                warn(f"{entry['name']}: bound to {component} {version} by its repository and version only (there "
+                     "is no tag commit to compare with)")
+            agreeing.append((entry, found))
     if not agreeing:
         if other:
             raise art.Refusal(f"the --files of {component} {version} are another release's ({'; '.join(other)})")
@@ -339,16 +346,25 @@ def gather(registry_sources: dict, root: Path, component: str, version: str, cls
              f"default branch of {sot}); nothing published")
         return None
     row = idx.sot_releases(path, component).get(version)
-    commit = commit_override or (row or {}).get("commit")
+    row_tag, row_commit = (row or {}).get("tag"), (row or {}).get("commit")  # a tag row: the tag's own commit
+    commit = commit_override or row_commit
     if row is None and not commit_override:
         warn(f"{component} {version}: no row in the release table of its README; nothing built")
     elif not commit:
         warn(f"{component} {version}: its row names no commit; nothing built (pass --commit)")
+    elif row_tag and not row_commit:
+        warn(f"{component} {version}: its row names tag {row_tag!r}, which this checkout does not have, so the "
+             "commit of the release cannot be confirmed; nothing built")
+    elif commit_override and row_tag and not idx.same_commit(commit_override, row_commit):
+        raise art.Refusal(f"{component} {version}: --commit {commit_override[:12]} is not the commit of tag "
+                          f"{row_tag!r} ({row_commit[:12]}); a tagged release is built from its tag, so other "
+                          "bytes would be reported under the tag's commit")
     elif not is_ancestor(path, commit):
         warn(f"{component} {version}: {commit} is not on the default branch of {sot}; nothing built")
     else:
-        info.update(commit=commit, date=(row or {}).get("date") or idx.commit_date(path, commit),
-                    tag=(row or {}).get("tag"), tag_commit=(row or {}).get("tag_commit"))
+        moved = bool(commit_override) and bool(row_commit) and not idx.same_commit(commit_override, row_commit)
+        info.update(commit=commit, date=(None if moved else (row or {}).get("date")) or idx.commit_date(path, commit),
+                    tag=row_tag, tag_commit=row_commit if row_tag else None)
         info["requires"] = component_requires(path, commit, component)
         info["tree_at"] = (path, commit, component)
     return info
@@ -359,6 +375,10 @@ def tree_at(info: dict, path: Path | None, at: str | None, subtree: str, overrid
     info["path"] = subtree
     if path is None or not at:
         warn(f"{component}: no commit to read the tree at (no tag, no --commit); nothing built")
+    elif override and info.get("tag_commit") and not idx.same_commit(at, info["tag_commit"]):
+        raise art.Refusal(f"{component}: --commit {at[:12]} is not the commit of tag {info['tag']!r} "
+                          f"({info['tag_commit'][:12]}); a tagged release is built from its tag, so other bytes "
+                          "would be reported under the tag's commit")
     elif override and not is_ancestor(path, at):
         warn(f"{component}: {at} is not on the default branch; nothing built")
     else:
@@ -526,12 +546,14 @@ def bind_to_previous(component: str, version: str, destination: Path, listing: l
     return keep
 
 
-def reference_disagrees(previous: dict, info: dict) -> str | None:
-    """The commit a published version's manifest is bound to, when this publication reads another one for it."""
-    field = "tag_commit" if isinstance(previous.get("tag_commit"), str) and isinstance(info.get("tag_commit"), str) else "commit"
-    bound, now = previous.get(field), info.get(field)
-    if isinstance(bound, str) and isinstance(now, str) and not idx.same_commit(bound, now):
-        return bound
+def reference_disagrees(previous: dict, info: dict) -> tuple[str, str] | None:
+    """`(bound, now)` when this publication reads another commit than the one a published version's manifest is
+    bound to. Both the tag's commit and the commit of the bytes are compared: a matching tag commit does not make
+    other bytes the same release."""
+    for field in ("tag_commit", "commit"):
+        bound, now = previous.get(field), info.get(field)
+        if isinstance(bound, str) and isinstance(now, str) and not idx.same_commit(bound, now):
+            return bound, now
     return None
 
 
@@ -634,7 +656,11 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
              f"so the {idx.repository_class(sources, component)} releases of {component} stay as they are and both "
              f"are found in the index (declare it as `{own}: {cls}` in publication.classes)")
         component = own
-    info = gather(sources, root, component, version, cls, files_dir, tree_path, commit)
+    try:
+        info = gather(sources, root, component, version, cls, files_dir, tree_path, commit)
+    except art.Refusal as refusal:
+        print(f"refused: {refusal}; nothing written", file=sys.stderr)
+        return 3
     if info is None:
         print(f"{component} {version}: status=skipped; nothing published; {len(decl.WARNINGS)} warning(s)")
         return 0
@@ -667,9 +693,9 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
         old = {a["name"]: a for a in rows}
         built = bool(listing)
         listing = bind_to_previous(component, version, destination, listing, old)
-        bound_to = reference_disagrees(previous, info) if old else None
-        if bound_to and listing:
-            now = info.get("tag_commit") or info.get("commit")
+        disagreement = reference_disagrees(previous, info) if old else None
+        if disagreement and listing:
+            bound_to, now = disagreement
             warn(f"{component} {version}: already published from {bound_to[:12]}, and its source now names "
                  f"{now[:12]}; the published binding is kept and nothing is written (cut a new version)")
             listing = []
@@ -709,7 +735,7 @@ def publish(registry: Path, root: Path, component: str, version: str, *, cls: st
         if entry is None:
             warn(f"{component}: could not read its releases; the previous index entry is kept")
         else:
-            components[component] = idx.merge_history(component, entry, components.get(component))
+            components[component] = idx.merge_history(component, entry, components.get(component), artifacts_dir)
         components = {k: (e if idx.usable_entry(k, e) and "class" in e else idx.upgrade_entry(k, e, artifacts_dir))
                       for k, e in components.items()}
         idx.write_index(index_path, components)

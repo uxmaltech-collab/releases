@@ -28,7 +28,8 @@ is read (another repository with the same name is never labelled as this one).
 What cannot be read is reported on stderr and skipped; the index is still written. A source whose checkout is
 missing, whose declaration is bad, or that cannot be read this time (a version.json that is not JSON, no tag
 read), keeps the entries the previous index had for it, and every version a fresh read does not give is kept from
-the previous index, so a partial run never loses history. A row whose commit this read cannot resolve keeps the
+the previous index (a v1 row is read as v2), so a partial run never loses history. When the declaration given
+cannot be read and no verified copy exists, every previous entry the run does not read is kept as well. A row whose commit this read cannot resolve keeps the
 one resolved before. A published version keeps the reference its manifest is bound to: when the source now names
 another commit (a moved tag) it warns and the row keeps the published commit with its artifacts. An index that
 cannot be read is copied aside (`releases.json.unreadable`) before it is rebuilt. Exit status 0.
@@ -158,13 +159,15 @@ def load_sources(path: Path, declaration: str | Path | None = None, cache: Path 
     Without a declaration (or with no verified copy, or when it declares no `publication`) `sources.json` is read
     as before, with a warning that says where the declaration belongs. A bad entry warns and is skipped
     (`invalid`); the rest is read. `readable` is False when nothing could be read at all: callers then keep
-    everything they had. `exclude_known` is False when a declaration was given and which paths it excludes from
+    everything they had. `declaration_lost` is True when a declaration was given and neither it nor a verified copy
+    could be read: what is left (`sources.json`, a subset of what the canon declares) is not the whole list of what
+    the publisher publishes, so callers keep every previous entry they do not read fresh. `exclude_known` is False when a declaration was given and which paths it excludes from
     archives cannot be known (it could not be read, its `archive_exclude` is malformed, and there is no verified
     copy): no archive is built then, so a path the organization excludes is never packed.
     """
     declared_path = decl.path_from(declaration)
     data, digest = decl.read_with_digest(declared_path) if declared_path else (None, None)
-    origin, exclude_known = "none", True
+    origin, exclude_known, declaration_lost = "none", True, False
     if declared_path is not None:
         well_formed = data is not None and decl.exclusions(data.get("publication")) is not None
         if well_formed:
@@ -180,7 +183,7 @@ def load_sources(path: Path, declaration: str | Path | None = None, cache: Path 
                     warn(f"{declared_path}: `publication` or its `archive_exclude` is malformed")
                 warn(f"{declared_path}: no verified copy of the declaration is kept here; which paths it excludes "
                      "from archives is not known, so no archive is built (the index is still updated)")
-                exclude_known = False
+                exclude_known, declaration_lost = False, True
     chosen = None
     if data is not None:
         chosen = decl.publication(data, declared_path)
@@ -194,7 +197,7 @@ def load_sources(path: Path, declaration: str | Path | None = None, cache: Path 
     where = str(declared_path) if origin in ("declaration", "cache") else str(path)
     excluded = decl.exclusions(chosen) if chosen is not None else []
     sources = {"sot": None, "repositories": [], "classes": {}, "invalid": set(), "readable": chosen is not None,
-               "origin": origin, "vendors": decl.vendors(data, declared_path),
+               "origin": origin, "declaration_lost": declaration_lost, "vendors": decl.vendors(data, declared_path),
                "exclude": excluded or [], "exclude_known": exclude_known and excluded is not None}
     chosen = chosen or {}
     sot = chosen.get("sot")
@@ -543,6 +546,9 @@ def attach_manifests(components: dict, artifacts: Path, previous: dict | None = 
             else:
                 warn(f"{component_key} {release['version']!r}: cannot name a release folder; its manifest is not read")
             listed = manifest_artifacts(manifest, f"{component_key} {release['version']}") if manifest else None
+            if listed is None and isinstance(prior_release.get("artifacts"), list) and prior_release["artifacts"]:
+                # the artifacts come from the previous index: they stay with the commit that index bound them to
+                keep_published_binding(component_key, release, prior_release)
             if listed is not None:
                 release["artifacts"] = [{k: a[k] for k in ("name", "sha256", "bytes", "tree_digest") if k in a} for a in listed]
             else:
@@ -576,20 +582,25 @@ def keep_resolved_reference(component_key: str, release: dict, prior: dict) -> N
 
 
 def keep_published_binding(component_key: str, release: dict, manifest: dict) -> None:
-    """The artifacts of a published version are bound to the reference its manifest recorded. When a fresh read of
-    the source names another commit for the version (a tag moved), the row keeps the published binding (commit,
-    tag_commit, date of the manifest) and warns: the cached bytes are never advertised under another commit."""
-    field = "tag_commit" if isinstance(manifest.get("tag_commit"), str) and isinstance(release.get("tag_commit"), str) else "commit"
-    bound, fresh = manifest.get(field), release.get(field)
-    if isinstance(bound, str) and isinstance(fresh, str) and not same_commit(bound, fresh):
-        warn(f"{component_key} {release['version']}: the source now names {fresh[:12]}, but the version was published "
-             f"from {bound[:12]}; the published binding is kept (a published version takes no other bytes: cut a new one)")
-        for name in REFERENCE_FIELDS:
-            if isinstance(manifest.get(name), str):
-                release[name] = manifest[name]
-            elif name != "date":
-                release[name] = None
-    elif release.get("commit") is None:
+    """The artifacts of a published version are bound to the references its manifest recorded. When a fresh read of
+    the source names another commit for the version (a tag moved), or another commit for the bytes than the
+    manifest recorded (a matching tag commit is not enough), the row keeps the published binding (commit,
+    tag_commit, date of the manifest) and warns: the cached bytes are never advertised under another commit.
+    `manifest` is any mapping that holds those fields: the manifest, or the previous index row when the manifest
+    cannot be read."""
+    for field in ("tag_commit", "commit"):
+        bound, fresh = manifest.get(field), release.get(field)
+        if isinstance(bound, str) and isinstance(fresh, str) and not same_commit(bound, fresh):
+            warn(f"{component_key} {release['version']}: the source now names {fresh[:12]} as {field}, but the "
+                 f"version was published with {field} {bound[:12]}; the published binding is kept (a published "
+                 "version takes no other bytes: cut a new one)")
+            for name in REFERENCE_FIELDS:
+                if isinstance(manifest.get(name), str):
+                    release[name] = manifest[name]
+                elif name != "date":
+                    release[name] = None
+            return
+    if release.get("commit") is None:
         for name in REFERENCE_FIELDS:
             if release.get(name) is None and isinstance(manifest.get(name), str):
                 release[name] = manifest[name]
@@ -618,15 +629,20 @@ def upgrade_entry(component_key: str, entry, artifacts: Path):
     return entry
 
 
-def merge_history(component_key: str, fresh: dict, prior) -> dict:
+def merge_history(component_key: str, fresh: dict, prior, artifacts: Path) -> dict:
     """`fresh` with every release of `prior` it does not have (a checkout with only some tags, a manifest that cannot
-    be read): history is never dropped by a partial read. Each kept version warns."""
+    be read): history is never dropped by a partial read. Each kept version warns. A kept row from a v1 index is
+    read as v2 (class, repository, tag_commit, artifacts, requires), so the index never mixes raw v1 rows into v2."""
     if not usable_entry(component_key, prior):
         return fresh
     have = {r["version"] for r in fresh["releases"]}
     kept = [r for r in prior["releases"] if r["version"] not in have]
     if not kept:
         return fresh
+    stand_in = {**prior, "releases": kept,
+                "class": prior.get("class") if prior.get("class") in CLASSES else fresh.get("class"),
+                "repository": prior.get("repository") or fresh.get("repository")}
+    kept = upgrade_entry(component_key, stand_in, artifacts)["releases"]
     warn(f"{component_key}: {', '.join(r['version'] for r in kept)} not read this time; kept from the previous index")
     ordered = sorted(fresh["releases"] + kept, key=lambda r: key(r["version"]), reverse=True)
     return {**fresh, "releases": ordered, "latest": ordered[0]["version"]}
@@ -738,10 +754,16 @@ def build(root: Path, sources: dict, artifacts: Path, previous: dict | None = No
         for k, entry in previous.items():
             if isinstance(entry, dict) and entry.get("kind") == "repository" and k not in fresh:
                 kept[k] = entry
+    if sources.get("declaration_lost"):
+        warn("the organization's declaration could not be read and no verified copy is kept, so what remains "
+             "declared is only part of it; every previous entry this run does not read is kept")
+        for k, entry in previous.items():
+            if k not in fresh:
+                kept.setdefault(k, entry)
     for k in sorted(kept):
         warn(f"{k}: kept from the previous index")
     attach_manifests(fresh, artifacts, previous)
-    fresh = {k: merge_history(k, e, previous.get(k)) for k, e in fresh.items()}
+    fresh = {k: merge_history(k, e, previous.get(k), artifacts) for k, e in fresh.items()}
     components = {**{k: upgrade_entry(k, e, artifacts) for k, e in kept.items() if k not in fresh}, **fresh}
     return dict(sorted(components.items()))
 

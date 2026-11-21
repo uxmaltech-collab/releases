@@ -1098,5 +1098,205 @@ class SecondReview(Case):
         self.assertIn("previously resolved", err)
 
 
+class ThirdReview(Case):
+    """Each finding of the third review (head 99bb02a), reproduced first: each of these failed on 99bb02a."""
+
+    def asset_list_dir(self, name: str, files: dict[str, bytes], record: dict, **top) -> Path:
+        """A `--files` directory whose asset list carries exactly `record` (a field a test omits stays omitted)."""
+        folder = self.tmp / name
+        folder.mkdir(parents=True)
+        for file_name, data in files.items():
+            (folder / file_name).write_bytes(data)
+        listing = {"schema": "collab.component-release/v1", "component": record, "targets": [],
+                   "files": [{"name": n, "sha256": art.sha256_bytes(d)} for n, d in sorted(files.items())], **top}
+        (folder / "collab-example.component.json").write_text(json.dumps(listing))
+        return folder
+
+    # blocker: a matching commit is not a matching release
+    def test_two_tags_on_one_commit_do_not_accept_each_others_assets(self):
+        repo = layer_repo(self, tags=("v1.0.0", "v1.0.1"))  # one commit, two tags
+        self.sources(repositories=["example-org/example-sre"])
+        commit = git(repo.path, "rev-parse", "HEAD")
+        files = release_files(self.tmp / "dist-1.0.0", {"example_sre-1.0.0-py3-none-any.whl": b"wheel 1.0.0"}, commit,
+                              version="1.0.0")
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "1.0.1",
+                                   files_dir=files, commit_changes=False)
+        self.assertEqual(code, 3)
+        self.assertIn("another release's", err)
+        self.assertFalse((self.registry / "artifacts").exists())
+        # the release the list names is published
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "1.0.0",
+                                 files_dir=files, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertTrue((self.registry / "artifacts/layer/example-org__example-sre/1.0.0/MANIFEST.json").is_file())
+        self.assertFalse((self.registry / "artifacts/layer/example-org__example-sre/1.0.1").exists())
+
+    def test_a_list_that_names_two_versions_binds_nothing_it_has_not_agreed_on(self):
+        repo = layer_repo(self, tags=("v1.0.0", "v1.0.1"))
+        self.sources(repositories=["example-org/example-sre"])
+        commit = git(repo.path, "rev-parse", "HEAD")
+        record = {"repository": "example-org/example-sre", "version": "1.0.1", "commit": commit}
+        files = self.asset_list_dir("dist-mixed", {"a.whl": b"w"}, record, version="1.0.0")
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "1.0.1",
+                                 files_dir=files, commit_changes=False)
+        self.assertEqual(code, 3)
+        self.assertFalse((self.registry / "artifacts").exists())
+
+    # blocker: a version alone, with no repository and no commit, binds nothing
+    def test_an_asset_list_without_repository_or_commit_binds_nothing(self):
+        repo = layer_repo(self, tags=("v1.0.0",))
+        self.sources(repositories=["example-org/example-sre"])
+        commit = git(repo.path, "rev-parse", "HEAD")
+        for label, record in (("bare", {"version": "1.0.0"}),
+                              ("no-repository", {"version": "1.0.0", "commit": commit}),
+                              ("no-commit", {"repository": "example-org/example-sre", "version": "1.0.0"}),
+                              ("no-version", {"repository": "example-org/example-sre", "commit": commit})):
+            files = self.asset_list_dir(f"dist-{label}", {"a.whl": b"w"}, record)
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "1.0.0",
+                                       files_dir=files, commit_changes=False)
+            self.assertEqual(code, 0, label)
+            self.assertIn("binds nothing", err, label)
+            self.assertFalse((self.registry / "artifacts").exists(), label)
+            by = {r["version"]: r for r in self.index()["components"]["example-org/example-sre"]["releases"]}
+            self.assertEqual(by["1.0.0"]["artifacts"], [], label)
+        # the whole record binds
+        files = self.asset_list_dir("dist-whole", {"a.whl": b"w"},
+                                    {"repository": "example-org/example-sre", "version": "1.0.0", "commit": commit})
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "1.0.0",
+                                 files_dir=files, commit_changes=False)
+        self.assertEqual(code, 0)
+        self.assertTrue((self.registry / "artifacts/layer/example-org__example-sre/1.0.0/a.whl").is_file())
+
+    # blocker: --commit cannot attach other bytes to a tagged release
+    def test_a_commit_override_cannot_replace_the_commit_of_a_tagged_sot_release(self):
+        repo = self.sot("| 0.1.2 | tag `recipe-v0.1.2` | Third. |\n")
+        tagged = repo.commit({"containers/recipe/Dockerfile": "FROM scratch\n"})
+        repo.tag("recipe-v0.1.2")
+        other = repo.commit({"containers/recipe/Dockerfile": "FROM scratch\nRUN other\n"})
+        repo.publish_head()
+        self.sources(sot="o/sot")
+        with cli_installed():
+            code, err = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2",
+                                       commit=other, commit_changes=False)
+        self.assertEqual(code, 3)
+        self.assertIn("tag", err)
+        self.assertFalse((self.registry / "artifacts").exists())
+        self.assertFalse((self.registry / "releases.json").exists())
+        # the commit the tag names (even abbreviated) is the same release: published, and the index says so
+        with cli_installed():
+            code, _ = self.run_quiet(pub.publish, self.registry, self.root, "containers/recipe", "0.1.2",
+                                     commit=tagged[:12], commit_changes=False)
+        self.assertEqual(code, 0)
+        manifest = json.loads((self.registry / "artifacts/image-recipe/containers__recipe/0.1.2/MANIFEST.json").read_text())
+        self.assertEqual((manifest["commit"], manifest["tag_commit"]), (tagged, tagged))
+        release = self.index()["components"]["containers/recipe"]["releases"][0]
+        self.assertEqual((release["commit"], release["tag_commit"]), (tagged, tagged))
+
+    def test_a_commit_override_cannot_replace_the_commit_of_a_tagged_repository_tree(self):
+        repo = Repo(self.root, "example-service")
+        tagged = repo.commit({"app/run.sh": "#!/bin/sh\n"})
+        repo.tag("v1.0.0", "m")
+        other = repo.commit({"app/run.sh": "#!/bin/sh\necho other\n"})
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-service"], classes={"example-org/example-service": "service"})
+        code, err = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-service", "1.0.0",
+                                   commit=other, commit_changes=False)
+        self.assertEqual(code, 3)
+        self.assertFalse((self.registry / "artifacts").exists())
+        # without a tag the override is the release's commit, as the README says
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-service", "1.0.1",
+                                 commit=other, commit_changes=False)
+        self.assertEqual(code, 0)
+        manifest = json.loads((self.registry / "artifacts/service/example-org__example-service/1.0.1/MANIFEST.json").read_text())
+        self.assertEqual(manifest["commit"], other)
+        self.assertIsNone(manifest.get("tag_commit"))
+
+    def test_a_manifest_whose_commit_and_tag_commit_differ_is_not_taken_for_agreeing(self):
+        """What the override bug already published: the tag's commit matched, the bytes' commit did not."""
+        repo = Repo(self.root, "example-service")
+        tagged = repo.commit({"app/run.sh": "#!/bin/sh\n"})
+        repo.tag("v1.0.0", "m")
+        other = repo.commit({"app/run.sh": "#!/bin/sh\necho other\n"})
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-service"], classes={"example-org/example-service": "service"})
+        folder = self.registry / "artifacts/service/example-org__example-service/1.0.0"
+        folder.mkdir(parents=True)
+        (folder / "MANIFEST.json").write_text(json.dumps({
+            "schema": "collab.release-manifest/v1", "component": "example-org/example-service", "class": "service",
+            "version": "1.0.0", "repository": "example-org/example-service", "tag": "v1.0.0", "tag_commit": tagged,
+            "commit": other, "artifacts": [{"name": "s.tar", "sha256": "a" * 64, "bytes": 1}]}))
+        sources = idx.load_sources(self.registry / "sources.json")
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts")
+        (release,) = components["example-org/example-service"]["releases"]
+        self.assertEqual(release["commit"], other)  # the commit of the bytes, not the tag's
+        self.assertIn("the published binding is kept", err)
+
+    # major: an unreadable manifest after a moved tag keeps the commit the cached bytes came from
+    def test_a_moved_tag_with_an_unreadable_manifest_keeps_the_commit_of_the_cached_artifacts(self):
+        repo = Repo(self.root, "example-core")
+        first = repo.commit({"composer.json": json.dumps({"name": "example-org/example-core"})})
+        repo.tag("v1.0.0", "m")
+        repo.publish_head()
+        self.sources(repositories=["example-org/example-core"], classes={"example-org/example-core": "php-package"})
+        self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-core", "1.0.0", commit_changes=False)
+        published = self.index()["components"]["example-org/example-core"]["releases"][0]
+        self.assertTrue(published["artifacts"])
+        repo.commit({"composer.json": json.dumps({"name": "example-org/example-core", "x": 1})})
+        git(repo.path, "tag", "-f", "-a", "v1.0.0", "-m", "moved")
+        repo.publish_head()
+        manifest = self.registry / "artifacts/php-package/example-org__example-core/1.0.0/MANIFEST.json"
+        manifest.write_text("{ not json")
+        sources = idx.load_sources(self.registry / "sources.json")
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", self.index()["components"])
+        (release,) = components["example-org/example-core"]["releases"]
+        self.assertEqual(release["artifacts"], published["artifacts"])
+        self.assertEqual((release["commit"], release["tag_commit"]), (first, first))
+        self.assertIn("the published binding is kept", err)
+
+    # major: a declaration that cannot be read never shrinks the index to what sources.json lists
+    def test_an_unreadable_declaration_without_a_copy_keeps_the_repositories_only_the_canon_declared(self):
+        layer_repo(self, "example-sre")
+        layer_repo(self, "example-canon-only")
+        self.sources(repositories=["example-org/example-sre"])
+        declared = self.declaration({"repositories": ["example-org/example-sre", "example-org/example-canon-only"]})
+        sources, _ = self.run_quiet(idx.load_sources, self.registry / "sources.json", declared, pub.decl.cache_file(self.registry))
+        previous, _ = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts")
+        self.assertEqual(sorted(previous), ["example-org/example-canon-only", "example-org/example-sre"])
+        declared.write_text("{ not json")  # the canon file cannot be read now, and no verified copy is kept
+        sources, err = self.run_quiet(idx.load_sources, self.registry / "sources.json", declared, self.tmp / "no-copy.json")
+        self.assertIn("no verified copy", err)
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", previous)
+        self.assertEqual(sorted(components), ["example-org/example-canon-only", "example-org/example-sre"])
+        self.assertIn("example-org/example-canon-only: kept from the previous index", err)
+        # a readable declaration is the authority: a repository it no longer lists leaves the index
+        declared = self.declaration({"repositories": ["example-org/example-sre"]})
+        sources, _ = self.run_quiet(idx.load_sources, self.registry / "sources.json", declared, self.tmp / "no-copy.json")
+        components, _ = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts", previous)
+        self.assertEqual(sorted(components), ["example-org/example-sre"])
+
+    # major: history kept from a v1 index is read as v2
+    def test_versions_kept_from_a_v1_index_gain_the_v2_fields(self):
+        layer_repo(self, tags=("v0.3.0",))  # the checkout has only the newest tag
+        self.sources(repositories=["example-org/example-sre"])
+        v1_row = {"version": "0.2.1", "date": "2026-01-01", "changelog": "Old.", "commit": "abc1234def"}
+        (self.registry / "releases.json").write_text(json.dumps({"schema": "collab.releases/v1", "components": {
+            "example-org/example-sre": {"repository": "example-org/example-sre", "kind": "repository", "latest": "0.2.1",
+                                        "releases": [v1_row]}}}))
+        sources = idx.load_sources(self.registry / "sources.json")
+        components, err = self.run_quiet(idx.build, self.root, sources, self.registry / "artifacts",
+                                         idx.read_index(self.registry / "releases.json"))
+        code, _ = self.run_quiet(pub.publish, self.registry, self.root, "example-org/example-sre", "0.3.0", commit_changes=False)
+        self.assertEqual(code, 0)
+        for rows in ([r for r in components["example-org/example-sre"]["releases"]],
+                     self.index()["components"]["example-org/example-sre"]["releases"]):
+            self.assertEqual([r["version"] for r in rows], ["0.3.0", "0.2.1"])
+            for row in rows:
+                for field in ("class", "repository", "tag_commit", "artifacts", "requires"):
+                    self.assertIn(field, row, (row["version"], field))
+            kept = rows[1]
+            self.assertEqual((kept["class"], kept["repository"], kept["artifacts"], kept["requires"], kept["commit"]),
+                             ("layer", "example-org/example-sre", [], [], "abc1234def"))
+
+
 if __name__ == "__main__":
     unittest.main()
