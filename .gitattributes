@@ -1,0 +1,6 @@
+# Zips of PHP packages and wheels go through Git LFS (keep in step with LFS_SUFFIXES in scripts/artifacts.py).
+# Tree tars (SoT components, image recipes), manifests and the small text files of a composition stay in plain git.
+artifacts/**/*.zip filter=lfs diff=lfs merge=lfs -text
+artifacts/**/*.whl filter=lfs diff=lfs merge=lfs -text
+artifacts/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+artifacts/**/*.tgz filter=lfs diff=lfs merge=lfs -text
